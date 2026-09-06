@@ -1,0 +1,499 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+BASE_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+BIN="$BASE_DIR/bin/mihomo"
+CONFIG_TEMPLATE="$BASE_DIR/config/config.template.yaml"
+HOME_DIR="$BASE_DIR/home"
+CONFIG="$HOME_DIR/config.yaml"
+PROVIDER_DIR="$HOME_DIR/providers"
+PROVIDER="$PROVIDER_DIR/subscription.yaml"
+SECRETS_DIR="$BASE_DIR/secrets"
+CURL_CONFIG="$SECRETS_DIR/subscription.curl"
+RUN_DIR="$BASE_DIR/run"
+LOG_DIR="$BASE_DIR/logs"
+LOG_FILE="$LOG_DIR/mihomo.screen.log"
+PID_FILE="$RUN_DIR/mihomo.pid"
+CONTROL_LOCK="$RUN_DIR/control.lock"
+SCREEN_NAME="mihomo-server"
+EXPECTED_LISTEN_HEX="0100007F:1ED2"
+PROXY_PORT_HEX="1ED2"
+CONTROLLER_PORT_HEX="2382"
+
+die() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+ensure_dirs() {
+  install -d -m 0700 "$HOME_DIR" "$PROVIDER_DIR" "$SECRETS_DIR" "$RUN_DIR" "$LOG_DIR"
+}
+
+require_bin() {
+  [[ -x "$BIN" ]] || die "找不到可执行文件：$BIN"
+}
+
+require_active_config() {
+  [[ -f "$CONFIG" ]] || die "尚未生成活动配置；请先运行：$0 set-url，然后运行：$0 update"
+  [[ -f "$PROVIDER" ]] || die "尚未安装订阅内容；请先运行：$0 update"
+}
+
+process_is_live() {
+  local pid="$1" state
+  [[ -r "/proc/$pid/status" ]] || return 1
+  state=$(awk '/^State:/ {print $2; exit}' "/proc/$pid/status" 2>/dev/null) || return 1
+  [[ -n "$state" && "$state" != "Z" ]]
+}
+
+managed_pid_matches() {
+  local pid="$1" expected actual
+  local -a argv=()
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  process_is_live "$pid" || return 1
+  expected=$(readlink -e -- "$BIN") || return 1
+  actual=$(readlink -e -- "/proc/$pid/exe" 2>/dev/null) || return 1
+  [[ "$actual" == "$expected" ]] || return 1
+  mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || return 1
+  [[ ${#argv[@]} -eq 5 ]] || return 1
+  [[ "${argv[0]}" == "$BIN" ]] || return 1
+  [[ "${argv[1]}" == "-d" && "${argv[2]}" == "$HOME_DIR" ]] || return 1
+  [[ "${argv[3]}" == "-f" && "${argv[4]}" == "$CONFIG" ]]
+}
+
+managed_pids() {
+  local proc pid
+  for proc in /proc/[0-9]*; do
+    pid=${proc##*/}
+    managed_pid_matches "$pid" && printf '%s\n' "$pid"
+  done
+}
+
+screen_session_tokens() {
+  screen -ls 2>/dev/null \
+    | awk -v name="$SCREEN_NAME" '$1 ~ ("^[0-9]+\\." name "$") {print $1}'
+}
+
+dead_screen_session_tokens() {
+  screen -ls 2>/dev/null \
+    | awk -v name="$SCREEN_NAME" \
+      '$1 ~ ("^[0-9]+\\." name "$") && $0 ~ /\(Dead \?\?\?\)/ {print $1}'
+}
+
+purge_dead_named_screens() {
+  local token
+  local -a all_screens=() dead_screens=()
+
+  mapfile -t all_screens < <(screen_session_tokens)
+  mapfile -t dead_screens < <(dead_screen_session_tokens)
+  [[ ${#all_screens[@]} -gt 0 ]] || return 1
+  [[ ${#all_screens[@]} -eq ${#dead_screens[@]} ]] || return 1
+  [[ -z "$(managed_pids)" ]] || return 1
+  [[ -z "$(listener_records_for_port "$PROXY_PORT_HEX")" ]] || return 1
+
+  for token in "${dead_screens[@]}"; do
+    screen -wipe "$token" >/dev/null 2>&1 || true
+  done
+
+  mapfile -t all_screens < <(screen_session_tokens)
+  [[ ${#all_screens[@]} -eq 0 ]]
+}
+
+verified_screen_session() {
+  local token="$1" pid expected actual
+  local -a argv=()
+  [[ "$token" =~ ^([1-9][0-9]*)\.${SCREEN_NAME}$ ]] || return 1
+  pid=${BASH_REMATCH[1]}
+  process_is_live "$pid" || return 1
+  expected=$(readlink -e -- "$(command -v screen)") || return 1
+  actual=$(readlink -e -- "/proc/$pid/exe" 2>/dev/null) || return 1
+  [[ "$actual" == "$expected" ]] || return 1
+  mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || return 1
+  [[ ${#argv[@]} -eq 11 ]] || return 1
+  [[ "${argv[1]}" == "-L" ]] || return 1
+  [[ "${argv[2]}" == "-Logfile" && "${argv[3]}" == "$LOG_FILE" ]] || return 1
+  [[ "${argv[4]}" == "-dmS" && "${argv[5]}" == "$SCREEN_NAME" ]] || return 1
+  [[ "${argv[6]}" == "$BIN" ]] || return 1
+  [[ "${argv[7]}" == "-d" && "${argv[8]}" == "$HOME_DIR" ]] || return 1
+  [[ "${argv[9]}" == "-f" && "${argv[10]}" == "$CONFIG" ]]
+}
+
+verified_screen_tokens() {
+  local token
+  while IFS= read -r token; do
+    verified_screen_session "$token" && printf '%s\n' "$token"
+  done < <(screen_session_tokens)
+}
+
+pid_parent() {
+  local pid="$1"
+  awk '/^PPid:/ {print $2; exit}' "/proc/$pid/status" 2>/dev/null
+}
+
+listener_records_for_port() {
+  local port_hex="$1"
+  awk -v suffix=":$port_hex" \
+    'FNR > 1 && substr($2, length($2) - length(suffix) + 1) == suffix && $4 == "0A" {print $2, $10}' \
+    /proc/net/tcp /proc/net/tcp6
+}
+
+inode_owner_pids() {
+  local inode="$1" proc pid fd target
+  for proc in /proc/[0-9]*; do
+    pid=${proc##*/}
+    for fd in "$proc/fd/"*; do
+      [[ -e "$fd" ]] || continue
+      target=$(readlink -- "$fd" 2>/dev/null || true)
+      if [[ "$target" == "socket:[$inode]" ]]; then
+        printf '%s\n' "$pid"
+        break
+      fi
+    done
+  done
+}
+
+array_contains() {
+  local needle="$1" item
+  shift
+  for item in "$@"; do
+    [[ "$item" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+healthy_pid() {
+  local address inode owner screen_token screen_pid parent
+  local -a pids=() listeners=() owners=() screens=() all_screens=()
+  mapfile -t pids < <(managed_pids)
+  mapfile -t listeners < <(listener_records_for_port "$PROXY_PORT_HEX")
+  mapfile -t screens < <(verified_screen_tokens)
+  mapfile -t all_screens < <(screen_session_tokens)
+  [[ ${#pids[@]} -eq 1 ]] || return 1
+  [[ ${#listeners[@]} -eq 1 ]] || return 1
+  [[ ${#screens[@]} -eq 1 && ${#all_screens[@]} -eq 1 ]] || return 1
+  [[ $(listener_records_for_port "$CONTROLLER_PORT_HEX" | wc -l) -eq 0 ]] || return 1
+
+  read -r address inode <<< "${listeners[0]}"
+  [[ "$address" == "$EXPECTED_LISTEN_HEX" && -n "$inode" ]] || return 1
+  mapfile -t owners < <(inode_owner_pids "$inode")
+  [[ ${#owners[@]} -eq 1 ]] || return 1
+  owner=${owners[0]}
+  [[ "$owner" == "${pids[0]}" ]] || return 1
+
+  screen_token=${screens[0]}
+  screen_pid=${screen_token%%.*}
+  parent=$(pid_parent "$owner")
+  [[ "$parent" == "$screen_pid" ]] || return 1
+  printf '%s\n' "$owner"
+}
+
+port_has_external_owner() {
+  local record address inode owner
+  local -a managed=() owners=()
+  mapfile -t managed < <(managed_pids)
+  while IFS= read -r record; do
+    [[ -n "$record" ]] || continue
+    read -r address inode <<< "$record"
+    mapfile -t owners < <(inode_owner_pids "$inode")
+    [[ ${#owners[@]} -gt 0 ]] || return 0
+    for owner in "${owners[@]}"; do
+      array_contains "$owner" "${managed[@]}" || return 0
+    done
+  done < <(listener_records_for_port "$PROXY_PORT_HEX")
+  return 1
+}
+
+write_pid_file() {
+  local pid="$1"
+  umask 077
+  printf '%s\n' "$pid" > "$PID_FILE"
+}
+
+wait_for_managed_exit() {
+  local i pid alive
+  local -a targets=("$@")
+  for i in {1..40}; do
+    alive=0
+    for pid in "${targets[@]}"; do
+      managed_pid_matches "$pid" && alive=1
+    done
+    [[ "$alive" -eq 0 ]] && return 0
+    sleep 0.25
+  done
+  return 1
+}
+
+terminate_managed_pids() {
+  local pid
+  local -a targets=("$@")
+  [[ ${#targets[@]} -gt 0 ]] || return 0
+  for pid in "${targets[@]}"; do
+    managed_pid_matches "$pid" && kill -TERM "$pid"
+  done
+  wait_for_managed_exit "${targets[@]}"
+}
+
+close_verified_screens() {
+  local token
+  local -a tokens=()
+  mapfile -t tokens < <(verified_screen_tokens)
+  for token in "${tokens[@]}"; do
+    verified_screen_session "$token" || continue
+    screen -S "$token" -X quit >/dev/null 2>&1 || true
+  done
+}
+
+wait_for_verified_screens_exit() {
+  local i
+  for i in {1..20}; do
+    [[ -z "$(verified_screen_tokens)" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+set_url() {
+  local url escaped tmp
+  ensure_dirs
+  [[ -t 0 ]] || die "为避免订阅凭据进入命令历史，请在交互式终端中运行此命令"
+
+  IFS= read -r -s -p '请输入 HTTPS Clash 订阅 URL：' url
+  printf '\n'
+  [[ "$url" == https://* ]] || die "只接受 HTTPS 订阅 URL"
+  [[ ! "$url" =~ [[:cntrl:]] ]] || die "URL 中包含控制字符"
+
+  escaped=${url//\\/\\\\}
+  escaped=${escaped//\"/\\\"}
+  umask 077
+  tmp=$(mktemp "$SECRETS_DIR/subscription.curl.XXXXXX")
+  printf 'url = "%s"\n' "$escaped" > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$CURL_CONFIG"
+  unset url escaped
+  printf '订阅凭据已保存到仅当前用户可读的文件；未回显 URL。\n'
+}
+
+update_subscription() (
+  set -Eeuo pipefail
+  local candidate test_dir bytes mode
+  ensure_dirs
+  require_bin
+  [[ -f "$CURL_CONFIG" ]] || die "缺少订阅凭据；请先运行：$0 set-url"
+  mode=$(stat -c '%a' "$CURL_CONFIG")
+  [[ "$mode" == "600" ]] || die "订阅凭据权限必须是 0600，当前为 $mode"
+  [[ $(wc -l < "$CURL_CONFIG") -eq 1 ]] || die "订阅凭据文件格式异常"
+  grep -Eq '^url = "https://.*"$' "$CURL_CONFIG" || die "订阅凭据文件必须只包含一个 HTTPS URL"
+
+  candidate=$(mktemp "$RUN_DIR/subscription.XXXXXX")
+  test_dir=$(mktemp -d "$RUN_DIR/test.XXXXXX")
+  trap 'rm -f -- "$candidate"; rm -rf -- "$test_dir"' EXIT
+
+  curl --config "$CURL_CONFIG" \
+    --fail --location --proto '=https' --tlsv1.2 \
+    --connect-timeout 20 --max-time 120 --retry 2 \
+    --max-filesize 8388608 --compressed --silent --show-error \
+    --header 'User-Agent: mihomo/1.19.30' \
+    --output "$candidate"
+
+  bytes=$(wc -c < "$candidate")
+  (( bytes > 0 )) || die "订阅返回了空文件"
+  (( bytes <= 8388608 )) || die "订阅超过 8 MiB 安全上限"
+
+  install -d -m 0700 "$test_dir/providers"
+  install -m 0600 "$candidate" "$test_dir/providers/subscription.yaml"
+  install -m 0600 "$CONFIG_TEMPLATE" "$test_dir/config.yaml"
+  "$BIN" -t -d "$test_dir" -f "$test_dir/config.yaml"
+
+  if [[ -f "$PROVIDER" ]]; then
+    install -m 0600 "$PROVIDER" "$PROVIDER.previous"
+  fi
+  install -m 0600 "$candidate" "$PROVIDER.next"
+  mv -f -- "$PROVIDER.next" "$PROVIDER"
+  install -m 0600 "$CONFIG_TEMPLATE" "$CONFIG.next"
+  mv -f -- "$CONFIG.next" "$CONFIG"
+  printf '订阅已通过 Mihomo 语法校验并原子安装。\n'
+  if [[ -n "$(managed_pids)" ]]; then
+    printf '当前进程仍使用旧内容；请运行：%s restart\n' "$0"
+  fi
+)
+
+test_config() {
+  ensure_dirs
+  require_bin
+  require_active_config
+  "$BIN" -t -d "$HOME_DIR" -f "$CONFIG"
+}
+
+status_mihomo() {
+  local pid
+  local -a pids=() listeners=() owners=() screens=() all_screens=()
+  if pid=$(healthy_pid); then
+    printf 'running pid=%s mode=screen listen=127.0.0.1:7890\n' "$pid"
+    return 0
+  fi
+  mapfile -t pids < <(managed_pids)
+  mapfile -t listeners < <(listener_records_for_port "$PROXY_PORT_HEX")
+  mapfile -t screens < <(verified_screen_tokens)
+  mapfile -t all_screens < <(screen_session_tokens)
+  if [[ ${#pids[@]} -eq 0 && ${#listeners[@]} -eq 0 && ${#all_screens[@]} -eq 0 ]]; then
+    printf 'stopped\n'
+    return 3
+  fi
+  if [[ ${#listeners[@]} -gt 0 ]] && port_has_external_owner; then
+    printf 'conflict managed_processes=%s proxy_listeners=%s verified_screens=%s named_screens=%s\n' \
+      "${#pids[@]}" "${#listeners[@]}" "${#screens[@]}" "${#all_screens[@]}"
+    return 5
+  fi
+  if [[ ${#listeners[@]} -eq 1 ]]; then
+    local address inode
+    read -r address inode <<< "${listeners[0]}"
+    mapfile -t owners < <(inode_owner_pids "$inode")
+  fi
+  printf 'degraded managed_processes=%s proxy_listeners=%s listener_owners=%s verified_screens=%s named_screens=%s\n' \
+    "${#pids[@]}" "${#listeners[@]}" "${#owners[@]}" "${#screens[@]}" "${#all_screens[@]}"
+  return 4
+}
+
+stop_unlocked() {
+  local remaining
+  local -a pids=() all_screens=() verified_screens=()
+  mapfile -t pids < <(managed_pids)
+  mapfile -t all_screens < <(screen_session_tokens)
+  mapfile -t verified_screens < <(verified_screen_tokens)
+  if [[ ${#all_screens[@]} -ne ${#verified_screens[@]} ]]; then
+    purge_dead_named_screens || die "存在同名但无法验证归属的 Screen 会话；未自动关闭"
+    mapfile -t all_screens < <(screen_session_tokens)
+    mapfile -t verified_screens < <(verified_screen_tokens)
+  fi
+  if [[ ${#pids[@]} -gt 0 ]]; then
+    terminate_managed_pids "${pids[@]}" \
+      || die "受管 Mihomo 进程在 10 秒内未退出；未自动发送 SIGKILL"
+  fi
+  close_verified_screens
+  wait_for_verified_screens_exit || die "验证后的 Screen 会话在 2 秒内未退出"
+  rm -f -- "$PID_FILE"
+  remaining=$(listener_records_for_port "$PROXY_PORT_HEX" | wc -l)
+  if [[ "$remaining" -gt 0 ]]; then
+    die "受管进程已停止，但 7890 仍被外部进程监听"
+  fi
+  printf 'Mihomo 已停止。\n'
+}
+
+start_unlocked() {
+  local pid
+  local -a pids=() all_screens=() verified_screens=()
+  require_bin
+  require_active_config
+  command -v screen >/dev/null 2>&1 || die "当前环境缺少 GNU Screen"
+  test_config
+
+  if pid=$(healthy_pid); then
+    write_pid_file "$pid"
+    status_mihomo
+    return 0
+  fi
+
+  mapfile -t all_screens < <(screen_session_tokens)
+  mapfile -t verified_screens < <(verified_screen_tokens)
+  if [[ ${#all_screens[@]} -ne ${#verified_screens[@]} ]]; then
+    purge_dead_named_screens || die "存在同名但无法验证归属的 Screen 会话；拒绝覆盖"
+    mapfile -t all_screens < <(screen_session_tokens)
+    mapfile -t verified_screens < <(verified_screen_tokens)
+  fi
+  if [[ -n "$(listener_records_for_port "$PROXY_PORT_HEX")" ]] && port_has_external_owner; then
+    die "7890 被非受管或无法识别的进程监听；拒绝启动"
+  fi
+
+  mapfile -t pids < <(managed_pids)
+  if [[ ${#pids[@]} -gt 0 ]]; then
+    terminate_managed_pids "${pids[@]}" \
+      || die "受管 Mihomo 进程在 10 秒内未退出；未自动发送 SIGKILL"
+  fi
+  close_verified_screens
+  wait_for_verified_screens_exit || die "旧 Screen 会话在 2 秒内未退出"
+  if [[ -n "$(listener_records_for_port "$PROXY_PORT_HEX")" ]]; then
+    die "清理受管进程后 7890 仍被占用；拒绝启动"
+  fi
+  if [[ -n "$(listener_records_for_port "$CONTROLLER_PORT_HEX")" ]]; then
+    die "9090 已存在监听；为保持安全边界而拒绝启动"
+  fi
+
+  umask 077
+  screen -L -Logfile "$LOG_FILE" -dmS "$SCREEN_NAME" \
+    "$BIN" -d "$HOME_DIR" -f "$CONFIG"
+
+  for _ in {1..40}; do
+    sleep 0.25
+    if pid=$(healthy_pid); then
+      write_pid_file "$pid"
+      status_mihomo
+      return 0
+    fi
+  done
+
+  mapfile -t pids < <(managed_pids)
+  terminate_managed_pids "${pids[@]}" || true
+  close_verified_screens || true
+  tail -n 40 -- "$LOG_FILE" >&2 || true
+  die "Mihomo 未达到单进程、Screen 子进程及回环监听一致的健康状态"
+}
+
+restart_unlocked() {
+  stop_unlocked
+  start_unlocked
+}
+
+with_control_lock() {
+  local operation="$1"
+  ensure_dirs
+  exec 8>"$CONTROL_LOCK"
+  flock -w 15 8 || die "无法在 15 秒内取得控制锁"
+  "$operation"
+}
+
+health_check() {
+  local pid http_status socks_status
+  pid=$(healthy_pid) || die "进程、Screen 或监听状态不健康；请先运行：$0 status"
+  http_status=$(env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+    curl --proxy http://127.0.0.1:7890 --silent --show-error --max-time 30 \
+    --output /dev/null --write-out '%{http_code}' https://cp.cloudflare.com) \
+    || die "HTTP CONNECT 测试失败"
+  socks_status=$(env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+    curl --proxy socks5h://127.0.0.1:7890 --silent --show-error --max-time 30 \
+    --output /dev/null --write-out '%{http_code}' https://cp.cloudflare.com) \
+    || die "SOCKS5h 测试失败"
+  [[ "$http_status" == "204" && "$socks_status" == "204" ]] \
+    || die "代理请求状态异常：HTTP=$http_status SOCKS=$socks_status"
+  printf 'healthy pid=%s http=204 socks5h=204\n' "$pid"
+}
+
+show_usage() {
+  cat <<'EOF'
+用法：mihomoctl <命令>
+
+  set-url   无回显地保存 HTTPS 订阅 URL
+  update    下载订阅、隔离校验并原子安装
+  test      校验当前活动配置
+  start     在控制锁内清理受管异常状态并启动单一 Screen 实例
+  stop      精确停止使用本目录配置的 Mihomo 进程和已验证 Screen
+  restart   在同一控制锁内停止并重新启动
+  status    联合检查进程、socket 所有者、Screen 父子关系和监听安全
+  health    额外验证 HTTP CONNECT 与 SOCKS5h 请求
+  logs      显示最近 80 行日志
+  version   显示 Mihomo 版本
+EOF
+}
+
+case "${1:-}" in
+  set-url) with_control_lock set_url ;;
+  update) with_control_lock update_subscription ;;
+  test) test_config ;;
+  start) with_control_lock start_unlocked ;;
+  stop) with_control_lock stop_unlocked ;;
+  restart) with_control_lock restart_unlocked ;;
+  status) status_mihomo ;;
+  health) health_check ;;
+  logs) tail -n 80 -- "$LOG_FILE" ;;
+  version) require_bin; "$BIN" -v ;;
+  *) show_usage; [[ -z "${1:-}" ]] || exit 2 ;;
+esac

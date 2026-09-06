@@ -1,0 +1,55 @@
+# Local/editor files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Secrets and credentials
+.env
+.env.*
+!.env.example
+**/auth.json
+**/*.key
+**/*.pem
+**/id_rsa*
+**/id_ed25519*
+
+# Mihomo binary, subscription, generated config, cache and runtime state
+/mihomo-server/bin/*
+!/mihomo-server/bin/.gitkeep
+/mihomo-server/home/config.yaml
+/mihomo-server/home/cache.db
+/mihomo-server/home/*.db
+/mihomo-server/home/providers/*
+!/mihomo-server/home/providers/.gitkeep
+/mihomo-server/secrets/*
+!/mihomo-server/secrets/.gitkeep
+/mihomo-server/run/*
+!/mihomo-server/run/.gitkeep
+/mihomo-server/logs/*
+!/mihomo-server/logs/.gitkeep
+core
+core.*
+*.bak
+*.bak.*
+*.previous
+
+# Codex authentication, chats, prompts and task runtime data
+**/.codex/
+**/codex-home/
+**/codex-headless-data/
+/codex-headless/jobs/
+/codex-headless/run/
+/codex-headless/bridge-bin/
+/prompts/
+**/events.jsonl
+**/session-id
+**/origin-rollout*
+**/prompt.txt
+**/progress.log
+**/proxy-check.log
+**/screen.log
+**/*.pid
+**/*.sqlite
+**/*.sqlite-*

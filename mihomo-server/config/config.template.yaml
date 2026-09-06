@@ -1,0 +1,45 @@
+# Local-only Mihomo configuration for a headless server.
+# The subscription is loaded as a provider so it cannot change listeners,
+# enable TUN, or replace the routing policy in this file.
+
+mixed-port: 7890
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+
+tun:
+  enable: false
+
+profile:
+  store-selected: true
+  store-fake-ip: false
+
+proxy-providers:
+  subscription:
+    type: file
+    path: ./providers/subscription.yaml
+    health-check:
+      enable: true
+      url: https://cp.cloudflare.com
+      interval: 600
+      timeout: 5000
+      lazy: true
+
+proxy-groups:
+  - name: PROXY
+    type: url-test
+    use:
+      - subscription
+    url: https://cp.cloudflare.com
+    interval: 600
+    timeout: 5000
+    tolerance: 100
+    lazy: true
+    empty-fallback: DIRECT
+
+rules:
+  - MATCH,PROXY

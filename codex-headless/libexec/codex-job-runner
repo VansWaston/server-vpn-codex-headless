@@ -1,0 +1,524 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+
+BASE_DIR='/workspace/codex-headless'
+DATA_MOUNT='/root/autodl-tmp'
+DATA_ROOT="$DATA_MOUNT/codex-headless"
+RUN_DIR="$DATA_ROOT/run"
+SESSION_LOCK_DIR="$RUN_DIR/session-locks"
+BRIDGE_CODEX="$DATA_ROOT/bridge-bin/codex"
+BRIDGE_RESOURCES_DIR="$DATA_ROOT/bridge-bin/codex-resources"
+BRIDGE_RESOURCES_MANIFEST="$DATA_ROOT/bridge-bin/codex-resources.sha256"
+BRIDGE_COMPANIONS_MANIFEST="$DATA_ROOT/bridge-bin/codex-companions.sha256"
+MIGRATED_HOME="$DATA_MOUNT/codex-home"
+DEFAULT_CODEX_HOME='/root/.codex'
+MIGRATION_LOCK="$DATA_MOUNT/.codex-home-migration.lock"
+STABLE_CODEX_BIN='/root/.local/bin/codex'
+MIHOMO_CTL='/workspace/mihomo-server/scripts/mihomoctl'
+
+die() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+write_value() {
+  local value="$1" target="$2" tmp
+  tmp="${target}.tmp.$$"
+  printf '%s\n' "$value" > "$tmp"
+  chmod 0600 "$tmp"
+  mv -f -- "$tmp" "$target"
+}
+
+require_private_root_file() {
+  local file="$1" permissions
+  [[ -f "$file" && ! -L "$file" ]] || die "私有任务文件不存在或类型异常"
+  [[ "$(stat -c '%u' "$file")" -eq 0 ]] || die "私有任务文件不属于 root"
+  permissions=$(stat -c '%a' "$file")
+  (( (8#$permissions & 0077) == 0 )) || die "私有任务文件权限过宽"
+}
+
+require_private_root_dir() {
+  local dir="$1" permissions
+  [[ -d "$dir" && ! -L "$dir" ]] || die "私有任务目录不存在或类型异常"
+  [[ "$(stat -c '%u' "$dir")" -eq 0 ]] || die "私有任务目录不属于 root"
+  permissions=$(stat -c '%a' "$dir")
+  (( (8#$permissions & 0077) == 0 )) || die "私有任务目录权限过宽"
+}
+
+validate_bridge_resources() {
+  local expected_codex_hash="$1" file entry_count actual_bwrap_hash actual_zsh_hash
+  local -a lines=()
+  require_private_root_dir "$BRIDGE_RESOURCES_DIR"
+  require_private_root_dir "$BRIDGE_RESOURCES_DIR/zsh"
+  require_private_root_dir "$BRIDGE_RESOURCES_DIR/zsh/bin"
+  for file in "$BRIDGE_RESOURCES_DIR/bwrap" "$BRIDGE_RESOURCES_DIR/zsh/bin/zsh"; do
+    require_private_root_file "$file"
+    [[ -x "$file" ]] || die "bridge Codex resource 不可执行"
+  done
+  entry_count=$(find "$BRIDGE_RESOURCES_DIR" -mindepth 1 -printf x | wc -c)
+  [[ "$entry_count" =~ ^[0-9]+$ && "$entry_count" -eq 4 ]] \
+    || die "bridge Codex resource 目录包含意外条目"
+  require_private_root_file "$BRIDGE_RESOURCES_MANIFEST"
+  mapfile -t lines < "$BRIDGE_RESOURCES_MANIFEST"
+  [[ ${#lines[@]} -eq 3 \
+     && "${lines[0]}" == "codex-sha256=$expected_codex_hash" \
+     && "${lines[1]}" =~ ^bwrap-sha256=[0-9a-f]{64}$ \
+     && "${lines[2]}" =~ ^zsh-sha256=[0-9a-f]{64}$ ]] \
+    || die "bridge Codex resource 清单异常"
+  actual_bwrap_hash=$(sha256sum -- "$BRIDGE_RESOURCES_DIR/bwrap" | awk '{print $1}')
+  actual_zsh_hash=$(sha256sum -- "$BRIDGE_RESOURCES_DIR/zsh/bin/zsh" | awk '{print $1}')
+  [[ "${lines[1]}" == "bwrap-sha256=$actual_bwrap_hash" \
+     && "${lines[2]}" == "zsh-sha256=$actual_zsh_hash" ]] \
+    || die "bridge Codex resource 内容发生变化"
+}
+
+validate_bridge_companions() {
+  local expected_codex_hash="$1" file path_count actual
+  local -a lines=()
+  require_private_root_dir "$DATA_ROOT/bridge-bin/codex-path"
+  path_count=$(find "$DATA_ROOT/bridge-bin/codex-path" -mindepth 1 -printf x | wc -c)
+  [[ "$path_count" =~ ^[0-9]+$ && "$path_count" -eq 1 ]] \
+    || die "bridge Codex codex-path 包含意外条目"
+  for file in \
+    "$DATA_ROOT/bridge-bin/codex-code-mode-host" \
+    "$DATA_ROOT/bridge-bin/codex-package.json" \
+    "$DATA_ROOT/bridge-bin/codex-path/rg" \
+    "$DATA_ROOT/bridge-bin/rg"; do
+    require_private_root_file "$file"
+  done
+  [[ -x "$DATA_ROOT/bridge-bin/codex-code-mode-host" \
+     && -x "$DATA_ROOT/bridge-bin/codex-path/rg" \
+     && -x "$DATA_ROOT/bridge-bin/rg" ]] \
+    || die "bridge Codex companion 不可执行"
+  require_private_root_file "$BRIDGE_COMPANIONS_MANIFEST"
+  mapfile -t lines < "$BRIDGE_COMPANIONS_MANIFEST"
+  [[ ${#lines[@]} -eq 5 \
+     && "${lines[0]}" == "codex-sha256=$expected_codex_hash" \
+     && "${lines[1]}" =~ ^code-mode-host-sha256=[0-9a-f]{64}$ \
+     && "${lines[2]}" =~ ^package-sha256=[0-9a-f]{64}$ \
+     && "${lines[3]}" =~ ^codex-path-rg-sha256=[0-9a-f]{64}$ \
+     && "${lines[4]}" =~ ^rg-sha256=[0-9a-f]{64}$ ]] \
+    || die "bridge Codex companion 清单异常"
+  actual=$(sha256sum -- "$DATA_ROOT/bridge-bin/codex-code-mode-host" | awk '{print $1}')
+  [[ "${lines[1]}" == "code-mode-host-sha256=$actual" ]] \
+    || die "bridge Codex code-mode host 内容发生变化"
+  actual=$(sha256sum -- "$DATA_ROOT/bridge-bin/codex-package.json" | awk '{print $1}')
+  [[ "${lines[2]}" == "package-sha256=$actual" ]] \
+    || die "bridge Codex package 内容发生变化"
+  actual=$(sha256sum -- "$DATA_ROOT/bridge-bin/codex-path/rg" | awk '{print $1}')
+  [[ "${lines[3]}" == "codex-path-rg-sha256=$actual" ]] \
+    || die "bridge Codex codex-path/rg 内容发生变化"
+  actual=$(sha256sum -- "$DATA_ROOT/bridge-bin/rg" | awk '{print $1}')
+  [[ "${lines[4]}" == "rg-sha256=$actual" ]] \
+    || die "bridge Codex rg 内容发生变化"
+}
+
+resolve_add_dir() {
+  local value="$1" resolved
+  [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
+    || die "附加写目录不能包含换行符"
+  resolved=$(realpath -e -- "$value") || die "附加写目录不存在"
+  [[ -d "$resolved" && "$resolved" == /workspace/* ]] \
+    || die "附加写目录必须是 /workspace 的现有子目录"
+  printf '%s\n' "$resolved"
+}
+
+codex_version_of() {
+  local binary="$1" raw version
+  [[ -f "$binary" && ! -L "$binary" && -x "$binary" ]] || return 1
+  raw=$("$binary" --version 2>/dev/null) || return 1
+  [[ "$raw" == codex-cli\ * && "$raw" != *$'\n'* ]] || return 1
+  version=${raw#codex-cli }
+  [[ "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]{0,127}$ ]] || return 1
+  printf '%s\n' "$version"
+}
+
+resolve_stable_codex() {
+  local resolved source_home base relative release current component mode matched=0
+  local -a components=()
+  [[ -L "$STABLE_CODEX_BIN" && "$(stat -c '%u' "$STABLE_CODEX_BIN")" -eq 0 ]] \
+    || return 1
+  resolved=$(realpath -e -- "$STABLE_CODEX_BIN") || return 1
+  [[ -f "$resolved" && ! -L "$resolved" && -x "$resolved" ]] || return 1
+
+  for source_home in "$CODEX_HOME" "$DEFAULT_CODEX_HOME"; do
+    base=$(realpath -e -- "$source_home" 2>/dev/null || true)
+    [[ -n "$base" && ( "$resolved" == "$base"/* ) ]] || continue
+    relative=${resolved#"$base"/}
+    [[ "$relative" == packages/standalone/releases/*/bin/codex ]] || continue
+    release=${relative#packages/standalone/releases/}
+    release=${release%/bin/codex}
+    [[ -n "$release" && "$release" != */* ]] || continue
+
+    current="$base"
+    components=(packages standalone releases "$release" bin codex)
+    mode=$(stat -Lc '%a' "$current" 2>/dev/null) || return 1
+    (( (8#$mode & 0022) == 0 )) || return 1
+    for component in "${components[@]}"; do
+      current="$current/$component"
+      mode=$(stat -Lc '%a' "$current" 2>/dev/null) || return 1
+      (( (8#$mode & 0022) == 0 )) || return 1
+    done
+    [[ "$(realpath -e -- "$current")" == "$resolved" ]] || return 1
+    matched=1
+    break
+  done
+  (( matched == 1 )) || return 1
+  printf '%s\n' "$resolved"
+}
+
+require_data_mount() {
+  local target source fstype options
+  read -r target source fstype options < <(
+    findmnt -rn -T "$DATA_MOUNT" -o TARGET,SOURCE,FSTYPE,OPTIONS
+  ) || die "无法确认数据盘挂载"
+  [[ "$target" == "$DATA_MOUNT" ]] || die "数据盘挂载点异常：$target"
+  [[ "$fstype" != "overlay" && ",$options," == *,rw,* ]] \
+    || die "数据盘不是独立可写挂载"
+}
+
+select_codex_home() {
+  if [[ -f "$MIGRATED_HOME/.migration-complete" ]]; then
+    export CODEX_HOME="$MIGRATED_HOME"
+  else
+    export CODEX_HOME="$DEFAULT_CODEX_HOME"
+  fi
+  [[ -d "$CODEX_HOME" ]] || die "CODEX_HOME 不存在：$CODEX_HOME"
+  [[ "$(stat -c '%u' "$CODEX_HOME")" -eq 0 ]] || die "CODEX_HOME 不属于 root"
+}
+
+require_migrated_compat_symlink() {
+  local marker="$MIGRATED_HOME/.compat-symlink-complete"
+  local default_real migrated_real mode uid gid recorded_status recorded_target
+  [[ -L "$DEFAULT_CODEX_HOME" && -f "$marker" && ! -L "$marker" ]] \
+    || die "Codex 兼容链接或完成标记不存在"
+  read -r mode uid gid < <(stat -c '%a %u %g' "$marker" 2>/dev/null) \
+    || die "无法读取 Codex 兼容完成标记"
+  [[ "$mode" == '600' && "$uid" == '0' && "$gid" == '0' ]] \
+    || die "Codex 兼容完成标记权限或属主异常"
+  recorded_status=$(sed -n 's/^status=//p' "$marker" 2>/dev/null) \
+    || die "无法读取 Codex 兼容完成状态"
+  recorded_target=$(sed -n 's/^target=//p' "$marker" 2>/dev/null) \
+    || die "无法读取 Codex 兼容完成目标"
+  [[ "$recorded_status" == 'complete' && "$recorded_target" == "$MIGRATED_HOME" ]] \
+    || die "Codex 兼容完成标记内容异常"
+  default_real=$(realpath -e -- "$DEFAULT_CODEX_HOME") \
+    || die "/root/.codex 兼容链接无法解析"
+  migrated_real=$(realpath -e -- "$MIGRATED_HOME") \
+    || die "迁移后的 CODEX_HOME 无法解析"
+  [[ "$default_real" == "$migrated_real" && "$CODEX_HOME" == "$MIGRATED_HOME" ]] \
+    || die "Codex 兼容链接或 CODEX_HOME 目标异常"
+}
+
+probe_codex_writer_lock() {
+  local file="$CODEX_HOME/thread-writer-locks/$SESSION_ID.lock" fd
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
+    return
+  fi
+  [[ -f "$file" && ! -L "$file" ]] \
+    || die "Codex 内置 thread-writer-lock 类型异常"
+  [[ "$(stat -c '%u' "$file")" -eq 0 ]] \
+    || die "Codex 内置 thread-writer-lock 不属于 root"
+  exec {fd}<"$file" || die "无法打开 Codex 内置 thread-writer-lock"
+  if ! flock -n "$fd"; then
+    exec {fd}>&-
+    die "Codex 内置 thread-writer-lock 正在被占用"
+  fi
+  flock -u "$fd"
+  exec {fd}>&-
+}
+
+load_job_add_dirs() {
+  local add_root="$JOB_DIR/add-dirs" entry value resolved total existing
+  local -a entries=()
+  ADD_DIRS=()
+  if [[ ! -e "$add_root" && ! -L "$add_root" ]]; then
+    return
+  fi
+  require_private_root_dir "$add_root"
+  mapfile -d '' -t entries < <(
+    find "$add_root" -mindepth 1 -maxdepth 1 -type f \
+      -name '[0-9][0-9][0-9][0-9]' -print0 | LC_ALL=C sort -z
+  )
+  total=$(find "$add_root" -mindepth 1 -maxdepth 1 -printf x | wc -c)
+  [[ "$total" =~ ^[0-9]+$ && "$total" -eq "${#entries[@]}" \
+     && ${#entries[@]} -le 32 ]] \
+    || die "任务附加写目录元数据异常"
+  ((${#entries[@]} == 0)) \
+    || [[ "$JOB_MODE" == 'vscode' && "$SANDBOX" == 'workspace-write' ]] \
+    || die "当前任务模式不能使用附加写目录"
+  for entry in "${entries[@]}"; do
+    require_private_root_file "$entry"
+    value=$(head -n 1 "$entry")
+    resolved=$(resolve_add_dir "$value")
+    [[ "$resolved" == "$value" ]] || die "任务附加写目录不是规范路径"
+    for existing in "${ADD_DIRS[@]}"; do
+      [[ "$existing" != "$resolved" ]] || die "任务包含重复的附加写目录"
+    done
+    ADD_DIRS+=("$resolved")
+  done
+}
+
+set_proxy_environment() {
+  export HTTP_PROXY='http://127.0.0.1:7890'
+  export HTTPS_PROXY="$HTTP_PROXY"
+  export ALL_PROXY='socks5h://127.0.0.1:7890'
+  export http_proxy="$HTTP_PROXY"
+  export https_proxy="$HTTPS_PROXY"
+  export all_proxy="$ALL_PROXY"
+  export NO_PROXY='127.0.0.1,localhost,::1'
+  export no_proxy="$NO_PROXY"
+}
+
+ensure_proxy() {
+  local attempt
+  if ! "$MIHOMO_CTL" status >>"$PROXY_LOG" 2>&1; then
+    "$MIHOMO_CTL" start >>"$PROXY_LOG" 2>&1 \
+      || die "Mihomo 无法启动；查看 $PROXY_LOG"
+  fi
+  for attempt in 1 2 3; do
+    if "$MIHOMO_CTL" health >>"$PROXY_LOG" 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  die "Mihomo 连续三次健康检查失败；查看 $PROXY_LOG"
+}
+
+capture_session_id() {
+  local candidate='' line
+  local type_re='"type"[[:space:]]*:[[:space:]]*"thread\.started"'
+  local id_re='"thread_id"[[:space:]]*:[[:space:]]*"([0-9A-Fa-f-]+)"'
+  [[ -f "$EVENTS_FILE" ]] || return 0
+  while IFS= read -r line; do
+    [[ "$line" =~ $type_re ]] || continue
+    if [[ "$line" =~ $id_re ]]; then
+      candidate="${BASH_REMATCH[1]}"
+      if [[ "$candidate" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+        if [[ "$MODE" == 'resume' && -n "$SESSION_ID" && "$candidate" != "$SESSION_ID" ]]; then
+          return 2
+        fi
+        write_value "$candidate" "$ATTEMPT_DIR/session-id"
+        return 0
+      fi
+    fi
+  done <"$EVENTS_FILE"
+  return 0
+}
+
+MODE="${1:-}"
+ATTEMPT_DIR="${2:-}"
+WORKDIR="${3:-}"
+SANDBOX="${4:-}"
+SESSION_ID=''
+
+[[ "$MODE" == "tui" || "$MODE" == "exec" || "$MODE" == "resume" ]] \
+  || die "内部模式无效"
+[[ $# -eq 4 ]] || die "内部参数数量无效"
+[[ -d "$ATTEMPT_DIR" ]] || die "任务目录不存在"
+ATTEMPT_DIR_REAL=$(realpath -e -- "$ATTEMPT_DIR") || die "无法解析任务目录"
+[[ "$ATTEMPT_DIR_REAL" == "$ATTEMPT_DIR" ]] || die "任务目录必须是规范路径"
+ATTEMPT_ID=$(basename -- "$ATTEMPT_DIR")
+ATTEMPTS_DIR=$(dirname -- "$ATTEMPT_DIR")
+JOB_DIR=$(dirname -- "$ATTEMPTS_DIR")
+JOB_NAME=$(basename -- "$JOB_DIR")
+[[ "$ATTEMPT_ID" =~ ^[0-9]{4}$ && "$(basename -- "$ATTEMPTS_DIR")" == 'attempts' ]] \
+  || die "任务目录层级无效"
+[[ "$(dirname -- "$JOB_DIR")" == "$DATA_ROOT/jobs" ]] \
+  || die "任务目录不在受管数据目录中"
+[[ "$JOB_NAME" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,47}$ ]] || die "任务名称无效"
+
+EVENTS_FILE="$ATTEMPT_DIR/events.jsonl"
+PROGRESS_FILE="$ATTEMPT_DIR/progress.log"
+FINAL_FILE="$ATTEMPT_DIR/final.md"
+PROXY_LOG="$ATTEMPT_DIR/proxy-check.log"
+SIGNAL_FILE="$ATTEMPT_DIR/signal"
+JOB_LOCK="$JOB_DIR/run.lock"
+SESSION_LOCK=''
+
+finish() {
+  local rc=$?
+  trap - EXIT HUP INT TERM
+  set +e
+  capture_session_id
+  if [[ -f "$SIGNAL_FILE" ]]; then
+    write_value 'interrupted' "$ATTEMPT_DIR/state"
+  elif [[ "$rc" -eq 0 ]]; then
+    write_value 'completed' "$ATTEMPT_DIR/state"
+  else
+    write_value 'failed' "$ATTEMPT_DIR/state"
+  fi
+  write_value "$rc" "$ATTEMPT_DIR/exit-code"
+  write_value "$(date -Is)" "$ATTEMPT_DIR/ended-at"
+}
+
+record_signal() {
+  write_value "$1" "$SIGNAL_FILE"
+}
+
+trap finish EXIT
+trap 'record_signal INT; exit 130' INT
+trap 'record_signal TERM; exit 143' TERM
+trap 'record_signal HUP; exit 129' HUP
+
+WORKDIR_REAL=$(realpath -e -- "$WORKDIR") || die "无法解析工作目录"
+[[ "$WORKDIR_REAL" == "$WORKDIR" && -d "$WORKDIR" ]] || die "工作目录必须是规范目录"
+[[ "$WORKDIR" == '/workspace' || "$WORKDIR" == /workspace/* ]] \
+  || die "工作目录必须位于 /workspace"
+[[ "$SANDBOX" == "read-only" || "$SANDBOX" == "workspace-write" ]] \
+  || die "sandbox 无效"
+[[ -x "$MIHOMO_CTL" ]] || die "Mihomo 控制器不存在"
+
+require_data_mount
+exec 7>"$JOB_LOCK"
+flock -n 7 || die "该任务已有一个运行实例；拒绝并发执行"
+if [[ -e "$MIGRATION_LOCK" || -L "$MIGRATION_LOCK" ]]; then
+  [[ -f "$MIGRATION_LOCK" && ! -L "$MIGRATION_LOCK" \
+     && "$(stat -c '%u' "$MIGRATION_LOCK")" -eq 0 ]] \
+    || die "迁移锁文件类型或属主异常"
+fi
+exec 8>>"$MIGRATION_LOCK"
+flock -s -w 15 8 || die "Codex 历史迁移正在进行；稍后重试"
+select_codex_home
+
+require_private_root_file "$JOB_DIR/workdir"
+require_private_root_file "$JOB_DIR/sandbox"
+[[ "$(head -n 1 "$JOB_DIR/workdir")" == "$WORKDIR" ]] \
+  || die "任务工作目录与 runner 参数不一致"
+[[ "$(head -n 1 "$JOB_DIR/sandbox")" == "$SANDBOX" ]] \
+  || die "任务 sandbox 与 runner 参数不一致"
+require_private_root_file "$JOB_DIR/mode"
+JOB_MODE=$(head -n 1 "$JOB_DIR/mode")
+case "$JOB_MODE" in
+  vscode)
+    [[ "$MODE" == 'resume' ]] || die "VS Code 接管任务只能以 resume 模式运行"
+    require_private_root_file "$JOB_DIR/codex-bin"
+    require_private_root_file "$JOB_DIR/codex-version"
+    require_private_root_file "$JOB_DIR/codex-sha256"
+    require_private_root_file "$JOB_DIR/origin-source"
+    [[ "$(head -n 1 "$JOB_DIR/origin-source")" == 'vscode' ]] \
+      || die "VS Code 接管任务来源元数据异常"
+    CODEX_BIN=$(head -n 1 "$JOB_DIR/codex-bin")
+    [[ "$CODEX_BIN" == "$BRIDGE_CODEX" ]] || die "bridge Codex 路径异常"
+    [[ -f "$CODEX_BIN" && ! -L "$CODEX_BIN" && -x "$CODEX_BIN" \
+       && "$(stat -c '%u' "$CODEX_BIN")" -eq 0 ]] \
+      || die "bridge Codex 类型异常"
+    EXPECTED_CODEX_VERSION=$(head -n 1 "$JOB_DIR/codex-version")
+    EXPECTED_CODEX_HASH=$(head -n 1 "$JOB_DIR/codex-sha256")
+    [[ "$EXPECTED_CODEX_HASH" =~ ^[0-9a-f]{64}$ ]] \
+      || die "bridge Codex 哈希元数据异常"
+    ;;
+  exec|tui)
+    if [[ "$JOB_MODE" == 'exec' ]]; then
+      [[ "$MODE" == 'exec' || "$MODE" == 'resume' ]] \
+        || die "exec 任务的内部运行模式异常"
+    else
+      [[ "$MODE" == 'tui' ]] || die "tui 任务的内部运行模式异常"
+    fi
+    CODEX_BIN=$(resolve_stable_codex) \
+      || die "稳定版 Codex CLI 无法安全解析"
+    EXPECTED_CODEX_VERSION=''
+    EXPECTED_CODEX_HASH=''
+    ;;
+  *)
+    die "任务模式无效"
+    ;;
+esac
+CODEX_VERSION=$(codex_version_of "$CODEX_BIN") || die "Codex 二进制不存在或无法执行"
+if [[ -n "$EXPECTED_CODEX_VERSION" && "$CODEX_VERSION" != "$EXPECTED_CODEX_VERSION" ]]; then
+  die "bridge Codex 版本与任务登记值不同"
+fi
+if [[ -n "$EXPECTED_CODEX_HASH" \
+      && "$(sha256sum -- "$CODEX_BIN" | awk '{print $1}')" != "$EXPECTED_CODEX_HASH" ]]; then
+  die "bridge Codex 内容与任务登记值不同"
+fi
+if [[ "$JOB_MODE" == 'vscode' ]]; then
+  validate_bridge_resources "$EXPECTED_CODEX_HASH"
+  validate_bridge_companions "$EXPECTED_CODEX_HASH"
+fi
+load_job_add_dirs
+if [[ "$MODE" == 'resume' ]]; then
+  require_private_root_file "$ATTEMPT_DIR/session-id"
+  SESSION_ID=$(head -n 1 "$ATTEMPT_DIR/session-id")
+  [[ "$SESSION_ID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
+    || die "保存的会话 ID 格式异常"
+fi
+if [[ "$MODE" == 'exec' || "$MODE" == 'resume' ]]; then
+  require_private_root_file "$ATTEMPT_DIR/prompt.txt"
+fi
+
+if [[ "$JOB_MODE" == 'vscode' ]]; then
+  require_migrated_compat_symlink
+fi
+if [[ "$MODE" == 'resume' ]]; then
+  require_private_root_dir "$SESSION_LOCK_DIR"
+  SESSION_LOCK="$SESSION_LOCK_DIR/$SESSION_ID.lock"
+  if [[ -e "$SESSION_LOCK" || -L "$SESSION_LOCK" ]]; then
+    [[ -f "$SESSION_LOCK" && ! -L "$SESSION_LOCK" ]] \
+      || die "受管 session lock 类型异常"
+    [[ "$(stat -c '%u' "$SESSION_LOCK")" -eq 0 ]] \
+      || die "受管 session lock 不属于 root"
+  fi
+  exec 6>>"$SESSION_LOCK"
+  chmod 0600 "$SESSION_LOCK"
+  flock -n 6 || die "同一会话已有另一个受管运行实例"
+fi
+set_proxy_environment
+write_value "$CODEX_BIN" "$ATTEMPT_DIR/codex-bin"
+write_value "$CODEX_VERSION" "$ATTEMPT_DIR/codex-version"
+write_value "$JOB_MODE" "$ATTEMPT_DIR/origin-source"
+write_value 'starting' "$ATTEMPT_DIR/state"
+write_value "$(date -Is)" "$ATTEMPT_DIR/started-at"
+ensure_proxy
+"$CODEX_BIN" login status >>"$PROXY_LOG" 2>&1 \
+  || die "Codex 未登录；请先运行 codex login --device-auth"
+if [[ "$JOB_MODE" == 'vscode' ]]; then
+  probe_codex_writer_lock
+fi
+write_value 'running' "$ATTEMPT_DIR/state"
+
+rc=0
+case "$MODE" in
+  tui)
+    "$CODEX_BIN" --no-alt-screen -C "$WORKDIR" --sandbox "$SANDBOX" || rc=$?
+    ;;
+  exec)
+    args=(exec --cd "$WORKDIR")
+    if [[ "$SANDBOX" == "workspace-write" ]]; then
+      # --approve-for-me selects workspace-write itself and conflicts with an
+      # explicit --sandbox flag in bridge-enabled Codex builds.
+      args+=(--approve-for-me)
+    else
+      args+=(--sandbox "$SANDBOX")
+    fi
+    args+=(--json --color never -o "$FINAL_FILE")
+    for add_dir in "${ADD_DIRS[@]}"; do
+      args+=(--add-dir "$add_dir")
+    done
+    args+=(-)
+    NO_COLOR=1 "$CODEX_BIN" "${args[@]}" \
+      <"$ATTEMPT_DIR/prompt.txt" >"$EVENTS_FILE" 2>"$PROGRESS_FILE" || rc=$?
+    capture_session_id
+    ;;
+  resume)
+    args=(exec --cd "$WORKDIR")
+    if [[ "$SANDBOX" == "workspace-write" ]]; then
+      args+=(--approve-for-me)
+    else
+      args+=(--sandbox "$SANDBOX")
+    fi
+    for add_dir in "${ADD_DIRS[@]}"; do
+      args+=(--add-dir "$add_dir")
+    done
+    args+=(resume --json -o "$FINAL_FILE" "$SESSION_ID" -)
+    NO_COLOR=1 "$CODEX_BIN" "${args[@]}" \
+      <"$ATTEMPT_DIR/prompt.txt" >"$EVENTS_FILE" 2>"$PROGRESS_FILE" || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      capture_session_id || rc=70
+    fi
+    ;;
+esac
+
+exit "$rc"

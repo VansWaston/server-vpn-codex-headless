@@ -1,0 +1,1619 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+umask 077
+
+BASE_DIR='/workspace/codex-headless'
+DATA_MOUNT='/root/autodl-tmp'
+DATA_ROOT="$DATA_MOUNT/codex-headless"
+JOBS_ROOT="$DATA_ROOT/jobs"
+RUN_DIR="$DATA_ROOT/run"
+SESSION_LOCK_DIR="$RUN_DIR/session-locks"
+BRIDGE_BIN_DIR="$DATA_ROOT/bridge-bin"
+BRIDGE_CODEX="$BRIDGE_BIN_DIR/codex"
+BRIDGE_RESOURCES_DIR="$BRIDGE_BIN_DIR/codex-resources"
+BRIDGE_RESOURCES_MANIFEST="$BRIDGE_BIN_DIR/codex-resources.sha256"
+BRIDGE_COMPANIONS_MANIFEST="$BRIDGE_BIN_DIR/codex-companions.sha256"
+MIGRATED_HOME="$DATA_MOUNT/codex-home"
+DEFAULT_CODEX_HOME='/root/.codex'
+MIGRATION_LOCK="$DATA_MOUNT/.codex-home-migration.lock"
+CODEX_BIN='/root/.local/bin/codex'
+RUNNER="$BASE_DIR/libexec/codex-job-runner"
+MIHOMO_CTL='/workspace/mihomo-server/scripts/mihomoctl'
+TEMP_FILES=()
+
+cleanup_temp_files() {
+  local file
+  set +e
+  for file in "${TEMP_FILES[@]}"; do
+    [[ -n "$file" ]] || continue
+    [[ "$file" == "$RUN_DIR"/.codexctl-* \
+       || "$file" == "$BRIDGE_BIN_DIR"/.codex.tmp.* ]] || continue
+    rm -f -- "$file"
+  done
+}
+
+trap cleanup_temp_files EXIT
+
+die() {
+  printf '错误：%s\n' "$*" >&2
+  exit 1
+}
+
+usage() {
+  cat <<'EOF'
+用法：
+  codexctl doctor
+  codexctl tui NAME WORKDIR [read-only|workspace-write]
+  codexctl exec NAME WORKDIR PROMPT_FILE [read-only|workspace-write]
+  codexctl stage-vscode-title NAME WORKDIR THREAD_TITLE PROMPT_FILE [read-only|workspace-write] [--add-dir DIR ...]
+  codexctl start NAME
+  codexctl resume NAME PROMPT_FILE
+  codexctl ide-ready NAME
+  codexctl status [NAME]
+  codexctl list
+  codexctl result NAME
+  codexctl chat NAME [--follow]
+  codexctl attach NAME
+  codexctl logs NAME [screen|progress|final|proxy]
+  codexctl stop NAME
+
+说明：
+  tui     在 GNU Screen 中启动可重连的交互式 Codex。
+  exec    启动无头任务；默认 read-only，日志和最终回复写入数据盘。
+  stage-vscode-title
+          按精确线程标题登记一个 VS Code 会话，但不启动。
+  start   启动已经登记且状态为 staged 的 VS Code 会话。
+  resume  使用该任务保存的准确会话 ID 继续无头任务，并创建新 attempt。
+  ide-ready
+          只读确认受管 VS Code 会话已经可以安全返回 IDE。
+  chat    以可读格式显示最新 attempt 的助手消息；--follow 持续跟随到终态。
+EOF
+}
+
+require_data_mount() {
+  local target source fstype options
+  read -r target source fstype options < <(
+    findmnt -rn -T "$DATA_MOUNT" -o TARGET,SOURCE,FSTYPE,OPTIONS
+  ) || die "无法确认数据盘挂载"
+  [[ "$target" == "$DATA_MOUNT" ]] || die "数据盘挂载点异常：$target"
+  [[ "$fstype" != "overlay" && ",$options," == *,rw,* ]] \
+    || die "数据盘不是独立可写挂载"
+}
+
+select_codex_home() {
+  if [[ -f "$MIGRATED_HOME/.migration-complete" ]]; then
+    export CODEX_HOME="$MIGRATED_HOME"
+  else
+    export CODEX_HOME="$DEFAULT_CODEX_HOME"
+  fi
+  [[ -d "$CODEX_HOME" ]] || die "CODEX_HOME 不存在：$CODEX_HOME"
+  [[ "$(stat -c '%u' "$CODEX_HOME")" -eq 0 ]] || die "CODEX_HOME 不属于 root"
+}
+
+set_proxy_environment() {
+  export HTTP_PROXY='http://127.0.0.1:7890'
+  export HTTPS_PROXY="$HTTP_PROXY"
+  export ALL_PROXY='socks5h://127.0.0.1:7890'
+  export http_proxy="$HTTP_PROXY"
+  export https_proxy="$HTTPS_PROXY"
+  export all_proxy="$ALL_PROXY"
+  export NO_PROXY='127.0.0.1,localhost,::1'
+  export no_proxy="$NO_PROXY"
+}
+
+ensure_layout() {
+  require_data_mount
+  install -d -m 0700 \
+    "$DATA_ROOT" "$JOBS_ROOT" "$RUN_DIR" "$SESSION_LOCK_DIR" "$BRIDGE_BIN_DIR"
+  [[ -x "$RUNNER" ]] || die "任务运行器不可执行：$RUNNER"
+  [[ -x "$CODEX_BIN" ]] || die "独立 Codex CLI 不存在：$CODEX_BIN"
+  [[ -x "$MIHOMO_CTL" ]] || die "Mihomo 控制器不存在：$MIHOMO_CTL"
+}
+
+lock_control() {
+  exec 9>"$RUN_DIR/control.lock"
+  flock -w 15 9 || die "无法取得任务控制锁"
+}
+
+lock_migration_shared() {
+  if [[ -e "$MIGRATION_LOCK" || -L "$MIGRATION_LOCK" ]]; then
+    [[ -f "$MIGRATION_LOCK" && ! -L "$MIGRATION_LOCK" \
+       && "$(stat -c '%u' "$MIGRATION_LOCK")" -eq 0 ]] \
+      || die "迁移锁文件类型或属主异常"
+  fi
+  exec 8>>"$MIGRATION_LOCK"
+  chmod 0600 "$MIGRATION_LOCK"
+  flock -s -w 15 8 || die "Codex 历史迁移正在进行；稍后重试"
+}
+
+validate_name() {
+  [[ "$1" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,47}$ ]] \
+    || die "NAME 只允许 1-48 个字母、数字、点、下划线或短横线"
+}
+
+validate_session_id() {
+  [[ "$1" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
+    || die "保存的会话 ID 格式异常"
+}
+
+validate_thread_title() {
+  local bytes
+  [[ -n "$1" ]] || die "THREAD_TITLE 不能为空"
+  bytes=$(printf '%s' "$1" | wc -c)
+  (( bytes <= 16384 )) || die "THREAD_TITLE 不能超过 16 KiB"
+}
+
+resolve_workdir() {
+  local resolved
+  resolved=$(realpath -e -- "$1") || die "工作目录不存在：$1"
+  [[ -d "$resolved" ]] || die "工作目录不是目录"
+  [[ "$resolved" == "/workspace" || "$resolved" == /workspace/* ]] \
+    || die "工作目录必须位于 /workspace"
+  printf '%s\n' "$resolved"
+}
+
+resolve_add_dir() {
+  local resolved
+  [[ "$1" != *$'\n'* && "$1" != *$'\r'* ]] \
+    || die "附加写目录不能包含换行符"
+  resolved=$(realpath -e -- "$1") || die "附加写目录不存在"
+  [[ -d "$resolved" ]] || die "附加写目录不是目录"
+  [[ "$resolved" == /workspace/* ]] \
+    || die "附加写目录必须是 /workspace 的子目录；不允许整个 /workspace"
+  printf '%s\n' "$resolved"
+}
+
+validate_sandbox() {
+  [[ "$1" == "read-only" || "$1" == "workspace-write" ]] \
+    || die "sandbox 只能是 read-only 或 workspace-write"
+}
+
+validate_prompt() {
+  local resolved bytes permissions
+  resolved=$(realpath -e -- "$1") || die "提示词文件不存在：$1"
+  [[ -f "$resolved" && -r "$resolved" ]] || die "提示词必须是可读普通文件"
+  bytes=$(stat -c '%s' "$resolved")
+  (( bytes > 0 && bytes <= 2097152 )) || die "提示词文件必须在 1 字节到 2 MiB 之间"
+  permissions=$(stat -c '%a' "$resolved")
+  (( (8#$permissions & 0077) == 0 )) \
+    || die "提示词文件不能允许 group/other 读取；请先执行 chmod 600"
+  printf '%s\n' "$resolved"
+}
+
+write_value() {
+  local value="$1" target="$2"
+  printf '%s\n' "$value" > "$target"
+  chmod 0600 "$target"
+}
+
+require_root_regular_file() {
+  local file="$1"
+  [[ -f "$file" && ! -L "$file" ]] || die "私有状态文件不存在或类型异常"
+  [[ "$(stat -c '%u' "$file")" -eq 0 ]] || die "私有状态文件不属于 root"
+}
+
+require_private_root_file() {
+  local file="$1" permissions
+  require_root_regular_file "$file"
+  permissions=$(stat -c '%a' "$file")
+  (( (8#$permissions & 0077) == 0 )) || die "私有状态文件权限过宽"
+}
+
+require_private_root_dir() {
+  local dir="$1" permissions
+  [[ -d "$dir" && ! -L "$dir" ]] || die "私有状态目录不存在或类型异常"
+  [[ "$(stat -c '%u' "$dir")" -eq 0 ]] || die "私有状态目录不属于 root"
+  permissions=$(stat -c '%a' "$dir")
+  (( (8#$permissions & 0077) == 0 )) || die "私有状态目录权限过宽"
+}
+
+latest_state_db() {
+  local -a names=()
+  command -v sqlite3 >/dev/null 2>&1 || die "缺少 sqlite3"
+  mapfile -t names < <(
+    find "$CODEX_HOME" -mindepth 1 -maxdepth 1 -type f -printf '%f\n' \
+      | awk '/^state_[0-9]+\.sqlite$/' \
+      | LC_ALL=C sort -V
+  )
+  [[ ${#names[@]} -gt 0 ]] || die "CODEX_HOME 中没有 state_*.sqlite"
+  STATE_DB="$CODEX_HOME/${names[${#names[@]}-1]}"
+  [[ -f "$STATE_DB" && ! -L "$STATE_DB" ]] || die "最新状态数据库类型异常"
+  [[ "$(stat -c '%u' "$STATE_DB")" -eq 0 ]] || die "状态数据库不属于 root"
+}
+
+session_id_from_exact_title() {
+  local title="$1" index="$CODEX_HOME/session_index.jsonl"
+  command -v python3 >/dev/null 2>&1 || die "缺少 python3，无法安全解析 session_index.jsonl"
+  require_root_regular_file "$index"
+  python3 - "$index" "$title" <<'PY'
+import json
+import re
+import sys
+
+index_path, expected_title = sys.argv[1], sys.argv[2]
+matches = []
+try:
+    with open(index_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            item = json.loads(line)
+            if item.get("thread_name") == expected_title:
+                candidate = item.get("id")
+                if not isinstance(candidate, str) or not re.fullmatch(
+                    r"[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}",
+                    candidate,
+                ):
+                    raise ValueError
+                matches.append(candidate)
+except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+    print("错误：session_index.jsonl 无法安全解析", file=sys.stderr)
+    raise SystemExit(2)
+
+if len(matches) != 1:
+    print("错误：THREAD_TITLE 没有精确唯一匹配一个会话", file=sys.stderr)
+    raise SystemExit(3)
+print(matches[0])
+PY
+}
+
+validate_rollout_session_meta() {
+  local rollout="$1" expected_id="$2"
+  command -v python3 >/dev/null 2>&1 || die "缺少 python3，无法验证 rollout"
+  python3 - "$rollout" "$expected_id" <<'PY'
+import json
+import sys
+
+path, expected = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        line = handle.readline(4 * 1024 * 1024 + 1)
+    if not line or len(line) > 4 * 1024 * 1024:
+        raise ValueError
+    item = json.loads(line)
+    payload = item.get("payload")
+    if item.get("type") != "session_meta" or not isinstance(payload, dict):
+        raise ValueError
+    if payload.get("id") != expected:
+        raise ValueError
+except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+    print("错误：rollout 的 session_meta 与目标会话不一致", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+validate_vscode_thread() {
+  local session_id="$1" row separator db_cwd rollout_path
+  validate_session_id "$session_id"
+  latest_state_db
+  separator=$'\x1f'
+  row=$(
+    sqlite3 -noheader -separator "$separator" "file:$STATE_DB?mode=ro" \
+      "PRAGMA query_only=ON;
+       SELECT source,
+              COALESCE(thread_source, ''),
+              archived,
+              history_mode,
+              cwd,
+              rollout_path,
+              cli_version
+         FROM threads
+        WHERE id = '$session_id';"
+  ) || die "无法只读查询 Codex 状态数据库"
+  [[ -n "$row" ]] || die "状态数据库中不存在匹配会话"
+  IFS="$separator" read -r \
+    THREAD_SOURCE THREAD_SOURCE_KIND THREAD_ARCHIVED THREAD_HISTORY_MODE \
+    db_cwd rollout_path THREAD_ORIGIN_CLI_VERSION <<<"$row"
+  [[ "$THREAD_SOURCE" == 'vscode' ]] || die "目标不是 VS Code 根会话"
+  [[ "$THREAD_SOURCE_KIND" == 'user' ]] || die "目标不是用户根线程"
+  [[ "$THREAD_ARCHIVED" == '0' ]] || die "目标会话已经归档"
+  [[ "$THREAD_HISTORY_MODE" == 'legacy' ]] || die "目标会话历史格式不支持安全接管"
+  THREAD_DB_CWD=$(resolve_workdir "$db_cwd")
+  [[ "$rollout_path" == /* && -f "$rollout_path" && ! -L "$rollout_path" ]] \
+    || die "目标 rollout 原始路径类型异常"
+  THREAD_ROLLOUT_REAL=$(realpath -e -- "$rollout_path") \
+    || die "目标 rollout 不存在"
+  [[ -f "$THREAD_ROLLOUT_REAL" && ! -L "$THREAD_ROLLOUT_REAL" ]] \
+    || die "目标 rollout 类型异常"
+  local sessions_real
+  sessions_real=$(realpath -e -- "$CODEX_HOME/sessions") \
+    || die "CODEX_HOME sessions 目录不存在"
+  [[ "$THREAD_ROLLOUT_REAL" == "$sessions_real"/* ]] \
+    || die "目标 rollout 未落在 canonical CODEX_HOME/sessions"
+  [[ "$(stat -c '%u' "$THREAD_ROLLOUT_REAL")" -eq 0 ]] \
+    || die "目标 rollout 不属于 root"
+  validate_rollout_session_meta "$THREAD_ROLLOUT_REAL" "$session_id"
+  [[ -n "$THREAD_ORIGIN_CLI_VERSION" ]] || THREAD_ORIGIN_CLI_VERSION='unknown'
+}
+
+compat_symlink_is_ready() {
+  local marker="$MIGRATED_HOME/.compat-symlink-complete"
+  local default_real migrated_real mode uid gid recorded_status recorded_target
+  [[ -L "$DEFAULT_CODEX_HOME" && -f "$marker" && ! -L "$marker" ]] || return 1
+  read -r mode uid gid < <(stat -c '%a %u %g' "$marker" 2>/dev/null) || return 1
+  [[ "$mode" == '600' && "$uid" == '0' && "$gid" == '0' ]] || return 1
+  recorded_status=$(sed -n 's/^status=//p' "$marker" 2>/dev/null) || return 1
+  recorded_target=$(sed -n 's/^target=//p' "$marker" 2>/dev/null) || return 1
+  [[ "$recorded_status" == 'complete' && "$recorded_target" == "$MIGRATED_HOME" ]] \
+    || return 1
+  default_real=$(realpath -e -- "$DEFAULT_CODEX_HOME" 2>/dev/null) || return 1
+  migrated_real=$(realpath -e -- "$MIGRATED_HOME" 2>/dev/null) || return 1
+  [[ "$default_real" == "$migrated_real" ]]
+}
+
+require_migrated_compat_symlink() {
+  compat_symlink_is_ready \
+    || die "/root/.codex 兼容链接或其完成标记尚未安全就绪"
+}
+
+codex_version_of() {
+  local binary="$1" raw version
+  [[ -f "$binary" && ! -L "$binary" && -x "$binary" ]] \
+    || return 1
+  [[ "$(stat -c '%u' "$binary")" -eq 0 ]] || return 1
+  raw=$("$binary" --version 2>/dev/null) || return 1
+  [[ "$raw" == codex-cli\ * && "$raw" != *$'\n'* ]] || return 1
+  version=${raw#codex-cli }
+  [[ "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]{0,127}$ ]] || return 1
+  printf '%s\n' "$version"
+}
+
+find_running_vscode_codex() {
+  local proc executable arg is_app_server count=0 starttime devino
+  local -a argv=()
+  RUNNING_VSCODE_CODEX=''
+  for proc in /proc/[0-9]*; do
+    executable=$(readlink -e -- "$proc/exe" 2>/dev/null || true)
+    [[ "$executable" == /root/.vscode-server/extensions/openai.chatgpt-*-linux-x64/bin/linux-x86_64/codex ]] \
+      || continue
+    argv=()
+    mapfile -d '' -t argv < "$proc/cmdline" 2>/dev/null || continue
+    is_app_server=0
+    for arg in "${argv[@]}"; do
+      [[ "$arg" == 'app-server' ]] && is_app_server=1
+    done
+    (( is_app_server == 1 )) || continue
+    starttime=$(awk '{print $22}' "$proc/stat" 2>/dev/null || true)
+    devino=$(stat -Lc '%d:%i' "$proc/exe" 2>/dev/null || true)
+    [[ "$starttime" =~ ^[0-9]+$ && "$devino" =~ ^[0-9]+:[0-9]+$ ]] || continue
+    count=$((count + 1))
+    RUNNING_VSCODE_CODEX="$executable"
+    RUNNING_VSCODE_PROC_EXE="$proc/exe"
+    RUNNING_VSCODE_STARTTIME="$starttime"
+    RUNNING_VSCODE_DEVINO="$devino"
+  done
+  (( count <= 1 )) || die "检测到多个 VS Code Codex app-server；拒绝猜测二进制版本"
+  RUNNING_VSCODE_CODEX_COUNT=$count
+}
+
+validate_running_vscode_identity() {
+  local resolved starttime devino arg is_app_server=0
+  local -a argv=()
+  resolved=$(readlink -e -- "$RUNNING_VSCODE_PROC_EXE" 2>/dev/null || true)
+  starttime=$(awk '{print $22}' "${RUNNING_VSCODE_PROC_EXE%/exe}/stat" 2>/dev/null || true)
+  devino=$(stat -Lc '%d:%i' "$RUNNING_VSCODE_PROC_EXE" 2>/dev/null || true)
+  [[ "$resolved" == "$RUNNING_VSCODE_CODEX" \
+     && "$starttime" == "$RUNNING_VSCODE_STARTTIME" \
+     && "$devino" == "$RUNNING_VSCODE_DEVINO" ]] || return 1
+  mapfile -d '' -t argv < "${RUNNING_VSCODE_PROC_EXE%/exe}/cmdline" 2>/dev/null \
+    || return 1
+  for arg in "${argv[@]}"; do
+    [[ "$arg" == 'app-server' ]] && is_app_server=1
+  done
+  (( is_app_server == 1 ))
+}
+
+running_vscode_version() {
+  local raw version
+  validate_running_vscode_identity || return 1
+  raw=$("$RUNNING_VSCODE_PROC_EXE" --version 2>/dev/null) || return 1
+  validate_running_vscode_identity || return 1
+  [[ "$raw" == codex-cli\ * && "$raw" != *$'\n'* ]] || return 1
+  version=${raw#codex-cli }
+  [[ "$version" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]{0,127}$ ]] || return 1
+  printf '%s\n' "$version"
+}
+
+running_vscode_hash() {
+  local hash
+  validate_running_vscode_identity || return 1
+  hash=$(sha256sum -- "$RUNNING_VSCODE_PROC_EXE" | awk '{print $1}') || return 1
+  validate_running_vscode_identity || return 1
+  [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$hash"
+}
+
+validate_source_bridge_resources() {
+  local source_binary="$1" root dir file permissions
+  root="$(dirname -- "$source_binary")/codex-resources"
+  for dir in "$root" "$root/zsh" "$root/zsh/bin"; do
+    [[ -d "$dir" && ! -L "$dir" && "$(stat -c '%u' "$dir")" -eq 0 ]] \
+      || die "VS Code Codex resource 目录类型或属主异常"
+    permissions=$(stat -c '%a' "$dir")
+    (( (8#$permissions & 0022) == 0 )) \
+      || die "VS Code Codex resource 目录可被非 root 修改"
+  done
+  for file in "$root/bwrap" "$root/zsh/bin/zsh"; do
+    [[ -f "$file" && ! -L "$file" && -x "$file" \
+       && "$(stat -c '%u' "$file")" -eq 0 ]] \
+      || die "VS Code Codex resource 文件类型、属主或执行权限异常"
+    permissions=$(stat -c '%a' "$file")
+    (( (8#$permissions & 0022) == 0 )) \
+      || die "VS Code Codex resource 文件可被非 root 修改"
+  done
+  SOURCE_BRIDGE_RESOURCES="$root"
+}
+
+validate_bridge_resource_tree() {
+  local file entry_count
+  require_private_root_dir "$BRIDGE_RESOURCES_DIR"
+  require_private_root_dir "$BRIDGE_RESOURCES_DIR/zsh"
+  require_private_root_dir "$BRIDGE_RESOURCES_DIR/zsh/bin"
+  for file in "$BRIDGE_RESOURCES_DIR/bwrap" "$BRIDGE_RESOURCES_DIR/zsh/bin/zsh"; do
+    require_private_root_file "$file"
+    [[ -x "$file" ]] || die "固定 bridge Codex resource 不可执行"
+  done
+  entry_count=$(find "$BRIDGE_RESOURCES_DIR" -mindepth 1 -printf x | wc -c)
+  [[ "$entry_count" =~ ^[0-9]+$ && "$entry_count" -eq 4 ]] \
+    || die "固定 bridge Codex resource 目录包含意外条目"
+}
+
+validate_bridge_resources() {
+  local expected_codex_hash="$1" actual_bwrap_hash actual_zsh_hash
+  local -a lines=()
+  validate_bridge_resource_tree
+  require_private_root_file "$BRIDGE_RESOURCES_MANIFEST"
+  mapfile -t lines < "$BRIDGE_RESOURCES_MANIFEST"
+  [[ ${#lines[@]} -eq 3 \
+     && "${lines[0]}" == "codex-sha256=$expected_codex_hash" \
+     && "${lines[1]}" =~ ^bwrap-sha256=[0-9a-f]{64}$ \
+     && "${lines[2]}" =~ ^zsh-sha256=[0-9a-f]{64}$ ]] \
+    || die "固定 bridge Codex resource 清单异常"
+  actual_bwrap_hash=$(sha256sum -- "$BRIDGE_RESOURCES_DIR/bwrap" | awk '{print $1}')
+  actual_zsh_hash=$(sha256sum -- "$BRIDGE_RESOURCES_DIR/zsh/bin/zsh" | awk '{print $1}')
+  [[ "${lines[1]}" == "bwrap-sha256=$actual_bwrap_hash" \
+     && "${lines[2]}" == "zsh-sha256=$actual_zsh_hash" ]] \
+    || die "固定 bridge Codex resource 内容发生变化"
+}
+
+ensure_bridge_resources() {
+  local source_binary="$1" expected_codex_hash="$2"
+  local source_hash target_hash manifest_value
+  [[ "$(sha256sum -- "$source_binary" | awk '{print $1}')" == "$expected_codex_hash" ]] \
+    || die "VS Code Codex resource 来源与 bridge 二进制不匹配"
+  validate_source_bridge_resources "$source_binary"
+
+  if [[ ! -e "$BRIDGE_RESOURCES_MANIFEST" && ! -L "$BRIDGE_RESOURCES_MANIFEST" ]]; then
+    if [[ -e "$BRIDGE_RESOURCES_DIR" || -L "$BRIDGE_RESOURCES_DIR" ]]; then
+      [[ -d "$BRIDGE_RESOURCES_DIR" && ! -L "$BRIDGE_RESOURCES_DIR" \
+         && "$(stat -c '%u' "$BRIDGE_RESOURCES_DIR")" -eq 0 ]] \
+        || die "固定 bridge Codex resource 目录类型或属主异常"
+    fi
+    install -d -m 0700 \
+      "$BRIDGE_RESOURCES_DIR" \
+      "$BRIDGE_RESOURCES_DIR/zsh" \
+      "$BRIDGE_RESOURCES_DIR/zsh/bin"
+    install -m 0700 -- "$SOURCE_BRIDGE_RESOURCES/bwrap" \
+      "$BRIDGE_RESOURCES_DIR/bwrap"
+    install -m 0700 -- "$SOURCE_BRIDGE_RESOURCES/zsh/bin/zsh" \
+      "$BRIDGE_RESOURCES_DIR/zsh/bin/zsh"
+    validate_bridge_resource_tree
+    printf -v manifest_value \
+      'codex-sha256=%s\nbwrap-sha256=%s\nzsh-sha256=%s' \
+      "$expected_codex_hash" \
+      "$(sha256sum -- "$BRIDGE_RESOURCES_DIR/bwrap" | awk '{print $1}')" \
+      "$(sha256sum -- "$BRIDGE_RESOURCES_DIR/zsh/bin/zsh" | awk '{print $1}')"
+    write_value "$manifest_value" "$BRIDGE_RESOURCES_MANIFEST"
+    sync -f "$BRIDGE_RESOURCES_DIR"
+  fi
+
+  validate_bridge_resources "$expected_codex_hash"
+  source_hash=$(sha256sum -- "$SOURCE_BRIDGE_RESOURCES/bwrap" | awk '{print $1}')
+  target_hash=$(sha256sum -- "$BRIDGE_RESOURCES_DIR/bwrap" | awk '{print $1}')
+  [[ "$source_hash" == "$target_hash" ]] \
+    || die "固定 bridge bwrap 与匹配的 VS Code 构建不同"
+  source_hash=$(sha256sum -- "$SOURCE_BRIDGE_RESOURCES/zsh/bin/zsh" | awk '{print $1}')
+  target_hash=$(sha256sum -- "$BRIDGE_RESOURCES_DIR/zsh/bin/zsh" | awk '{print $1}')
+  [[ "$source_hash" == "$target_hash" ]] \
+    || die "固定 bridge zsh 与匹配的 VS Code 构建不同"
+}
+
+validate_source_bridge_companions() {
+  local source_binary="$1" root file permissions
+  root=$(dirname -- "$source_binary")
+  [[ -d "$root/codex-path" && ! -L "$root/codex-path" \
+     && "$(stat -c '%u' "$root/codex-path")" -eq 0 ]] \
+    || die "VS Code Codex companion 目录类型或属主异常"
+  permissions=$(stat -c '%a' "$root/codex-path")
+  (( (8#$permissions & 0022) == 0 )) \
+    || die "VS Code Codex companion 目录可被非 root 修改"
+  for file in \
+    "$root/codex-code-mode-host" \
+    "$root/codex-package.json" \
+    "$root/codex-path/rg" \
+    "$root/rg"; do
+    [[ -f "$file" && ! -L "$file" && "$(stat -c '%u' "$file")" -eq 0 ]] \
+      || die "VS Code Codex companion 文件类型或属主异常"
+    permissions=$(stat -c '%a' "$file")
+    (( (8#$permissions & 0022) == 0 )) \
+      || die "VS Code Codex companion 文件可被非 root 修改"
+  done
+  [[ -x "$root/codex-code-mode-host" \
+     && -x "$root/codex-path/rg" \
+     && -x "$root/rg" ]] \
+    || die "VS Code Codex companion 执行权限异常"
+  SOURCE_BRIDGE_ROOT="$root"
+}
+
+validate_bridge_companions() {
+  local expected_codex_hash="$1" file path_count actual
+  local -a lines=()
+  require_private_root_dir "$BRIDGE_BIN_DIR/codex-path"
+  path_count=$(find "$BRIDGE_BIN_DIR/codex-path" -mindepth 1 -printf x | wc -c)
+  [[ "$path_count" =~ ^[0-9]+$ && "$path_count" -eq 1 ]] \
+    || die "固定 bridge codex-path 包含意外条目"
+  for file in \
+    "$BRIDGE_BIN_DIR/codex-code-mode-host" \
+    "$BRIDGE_BIN_DIR/codex-package.json" \
+    "$BRIDGE_BIN_DIR/codex-path/rg" \
+    "$BRIDGE_BIN_DIR/rg"; do
+    require_private_root_file "$file"
+  done
+  [[ -x "$BRIDGE_BIN_DIR/codex-code-mode-host" \
+     && -x "$BRIDGE_BIN_DIR/codex-path/rg" \
+     && -x "$BRIDGE_BIN_DIR/rg" ]] \
+    || die "固定 bridge companion 不可执行"
+  require_private_root_file "$BRIDGE_COMPANIONS_MANIFEST"
+  mapfile -t lines < "$BRIDGE_COMPANIONS_MANIFEST"
+  [[ ${#lines[@]} -eq 5 \
+     && "${lines[0]}" == "codex-sha256=$expected_codex_hash" \
+     && "${lines[1]}" =~ ^code-mode-host-sha256=[0-9a-f]{64}$ \
+     && "${lines[2]}" =~ ^package-sha256=[0-9a-f]{64}$ \
+     && "${lines[3]}" =~ ^codex-path-rg-sha256=[0-9a-f]{64}$ \
+     && "${lines[4]}" =~ ^rg-sha256=[0-9a-f]{64}$ ]] \
+    || die "固定 bridge companion 清单异常"
+  actual=$(sha256sum -- "$BRIDGE_BIN_DIR/codex-code-mode-host" | awk '{print $1}')
+  [[ "${lines[1]}" == "code-mode-host-sha256=$actual" ]] \
+    || die "固定 bridge code-mode host 内容发生变化"
+  actual=$(sha256sum -- "$BRIDGE_BIN_DIR/codex-package.json" | awk '{print $1}')
+  [[ "${lines[2]}" == "package-sha256=$actual" ]] \
+    || die "固定 bridge package 内容发生变化"
+  actual=$(sha256sum -- "$BRIDGE_BIN_DIR/codex-path/rg" | awk '{print $1}')
+  [[ "${lines[3]}" == "codex-path-rg-sha256=$actual" ]] \
+    || die "固定 bridge codex-path/rg 内容发生变化"
+  actual=$(sha256sum -- "$BRIDGE_BIN_DIR/rg" | awk '{print $1}')
+  [[ "${lines[4]}" == "rg-sha256=$actual" ]] \
+    || die "固定 bridge rg 内容发生变化"
+}
+
+ensure_bridge_companions() {
+  local source_binary="$1" expected_codex_hash="$2" relative manifest_value
+  local source_hash target_hash
+  [[ "$(sha256sum -- "$source_binary" | awk '{print $1}')" == "$expected_codex_hash" ]] \
+    || die "VS Code Codex companion 来源与 bridge 二进制不匹配"
+  validate_source_bridge_companions "$source_binary"
+  if [[ ! -e "$BRIDGE_COMPANIONS_MANIFEST" \
+        && ! -L "$BRIDGE_COMPANIONS_MANIFEST" ]]; then
+    install -d -m 0700 "$BRIDGE_BIN_DIR/codex-path"
+    install -m 0700 -- "$SOURCE_BRIDGE_ROOT/codex-code-mode-host" \
+      "$BRIDGE_BIN_DIR/codex-code-mode-host"
+    install -m 0600 -- "$SOURCE_BRIDGE_ROOT/codex-package.json" \
+      "$BRIDGE_BIN_DIR/codex-package.json"
+    install -m 0700 -- "$SOURCE_BRIDGE_ROOT/codex-path/rg" \
+      "$BRIDGE_BIN_DIR/codex-path/rg"
+    install -m 0700 -- "$SOURCE_BRIDGE_ROOT/rg" "$BRIDGE_BIN_DIR/rg"
+    printf -v manifest_value \
+      'codex-sha256=%s\ncode-mode-host-sha256=%s\npackage-sha256=%s\ncodex-path-rg-sha256=%s\nrg-sha256=%s' \
+      "$expected_codex_hash" \
+      "$(sha256sum -- "$BRIDGE_BIN_DIR/codex-code-mode-host" | awk '{print $1}')" \
+      "$(sha256sum -- "$BRIDGE_BIN_DIR/codex-package.json" | awk '{print $1}')" \
+      "$(sha256sum -- "$BRIDGE_BIN_DIR/codex-path/rg" | awk '{print $1}')" \
+      "$(sha256sum -- "$BRIDGE_BIN_DIR/rg" | awk '{print $1}')"
+    write_value "$manifest_value" "$BRIDGE_COMPANIONS_MANIFEST"
+    sync -f "$BRIDGE_BIN_DIR"
+  fi
+  validate_bridge_companions "$expected_codex_hash"
+  for relative in codex-code-mode-host codex-package.json codex-path/rg rg; do
+    source_hash=$(sha256sum -- "$SOURCE_BRIDGE_ROOT/$relative" | awk '{print $1}')
+    target_hash=$(sha256sum -- "$BRIDGE_BIN_DIR/$relative" | awk '{print $1}')
+    [[ "$source_hash" == "$target_hash" ]] \
+      || die "固定 bridge companion 与匹配的 VS Code 构建不同"
+  done
+}
+
+identify_current_vscode_codex() {
+  local candidate resolved version hash key unique=0
+  local -a candidates=()
+  local -A builds=()
+  find_running_vscode_codex
+  if (( RUNNING_VSCODE_CODEX_COUNT == 1 )); then
+    CURRENT_VSCODE_CODEX="$RUNNING_VSCODE_CODEX"
+    CURRENT_VSCODE_VERSION=$(running_vscode_version) \
+      || die "运行中的 VS Code Codex 二进制无法验证"
+    CURRENT_VSCODE_HASH=$(running_vscode_hash) \
+      || die "运行中的 VS Code Codex 二进制哈希无法验证"
+    return
+  fi
+
+  [[ -d /root/.vscode-server/extensions ]] \
+    || die "没有运行中的 VS Code Codex，也找不到已安装扩展"
+  mapfile -d '' -t candidates < <(
+    find /root/.vscode-server/extensions -mindepth 4 -maxdepth 4 -type f \
+      -path '/root/.vscode-server/extensions/openai.chatgpt-*-linux-x64/bin/linux-x86_64/codex' \
+      -print0
+  )
+  ((${#candidates[@]} > 0)) \
+    || die "没有运行中的 VS Code Codex，也找不到已安装扩展二进制"
+  for candidate in "${candidates[@]}"; do
+    resolved=$(realpath -e -- "$candidate") \
+      || die "已安装的 VS Code Codex 二进制无法解析"
+    [[ "$resolved" == "$candidate" && -x "$candidate" \
+       && "$(stat -c '%u' "$candidate")" -eq 0 ]] \
+      || die "已安装的 VS Code Codex 二进制类型或属主异常"
+    version=$(codex_version_of "$candidate") \
+      || die "已安装的 VS Code Codex 二进制无法执行"
+    hash=$(sha256sum -- "$candidate" | awk '{print $1}')
+    key="$version:$hash"
+    if [[ -z "${builds[$key]+set}" ]]; then
+      builds[$key]="$candidate"
+      unique=$((unique + 1))
+      CURRENT_VSCODE_CODEX="$candidate"
+      CURRENT_VSCODE_VERSION="$version"
+      CURRENT_VSCODE_HASH="$hash"
+    fi
+  done
+  (( unique == 1 )) \
+    || die "检测到多个不同的已安装 VS Code Codex 构建；无法唯一判断 IDE 版本"
+}
+
+ensure_bridge_binary() {
+  local source_version bridge_version source_hash bridge_hash tmp resource_source
+  if [[ -e "$BRIDGE_CODEX" || -L "$BRIDGE_CODEX" ]]; then
+    [[ -f "$BRIDGE_CODEX" && ! -L "$BRIDGE_CODEX" && -x "$BRIDGE_CODEX" ]] \
+      || die "固定 bridge Codex 二进制类型异常"
+    [[ "$(stat -c '%u' "$BRIDGE_CODEX")" -eq 0 ]] \
+      || die "固定 bridge Codex 二进制不属于 root"
+    bridge_version=$(codex_version_of "$BRIDGE_CODEX") \
+      || die "固定 bridge Codex 二进制无法执行"
+    bridge_hash=$(sha256sum -- "$BRIDGE_CODEX" | awk '{print $1}')
+    identify_current_vscode_codex
+    [[ "$bridge_version" == "$CURRENT_VSCODE_VERSION" ]] \
+      || die "固定 bridge Codex 与当前 IDE 版本不同"
+    [[ "$bridge_hash" == "$CURRENT_VSCODE_HASH" ]] \
+      || die "固定 bridge Codex 与当前 IDE 构建不同"
+    resource_source="$CURRENT_VSCODE_CODEX"
+  else
+    find_running_vscode_codex
+    (( RUNNING_VSCODE_CODEX_COUNT == 1 )) \
+      || die "没有固定 bridge 二进制，也没有唯一运行中的 VS Code app-server"
+    source_version=$(running_vscode_version) \
+      || die "运行中的 VS Code Codex 二进制无法验证"
+    tmp=$(mktemp "$BRIDGE_BIN_DIR/.codex.tmp.XXXXXX") \
+      || die "无法创建 bridge Codex 暂存文件"
+    TEMP_FILES+=("$tmp")
+    validate_running_vscode_identity \
+      || die "运行中的 VS Code Codex 进程在复制前发生变化"
+    install -m 0700 -- "$RUNNING_VSCODE_PROC_EXE" "$tmp" \
+      || die "无法持久复制 VS Code Codex 二进制"
+    source_hash=$(running_vscode_hash) \
+      || die "运行中的 VS Code Codex 进程在复制期间发生变化"
+    bridge_hash=$(sha256sum -- "$tmp" | awk '{print $1}')
+    [[ "$source_hash" == "$bridge_hash" ]] \
+      || die "VS Code Codex 二进制复制校验失败"
+    [[ "$(codex_version_of "$tmp")" == "$source_version" ]] \
+      || die "VS Code Codex 二进制版本复检失败"
+    sync -f "$tmp"
+    mv -T -- "$tmp" "$BRIDGE_CODEX"
+    TEMP_FILES[${#TEMP_FILES[@]}-1]=''
+    bridge_version="$source_version"
+    bridge_hash="$source_hash"
+    resource_source="$RUNNING_VSCODE_CODEX"
+  fi
+  ensure_bridge_resources "$resource_source" "$bridge_hash"
+  ensure_bridge_companions "$resource_source" "$bridge_hash"
+  BRIDGE_BINARY_VALUE="$BRIDGE_CODEX"
+  BRIDGE_VERSION_VALUE="$bridge_version"
+  BRIDGE_HASH_VALUE="$bridge_hash"
+}
+
+validate_job_bridge_binary() {
+  local job_dir="$1" saved_binary saved_version saved_hash actual_version actual_hash
+  require_private_root_file "$job_dir/codex-bin"
+  require_private_root_file "$job_dir/codex-version"
+  require_private_root_file "$job_dir/codex-sha256"
+  saved_binary=$(head -n 1 "$job_dir/codex-bin")
+  saved_version=$(head -n 1 "$job_dir/codex-version")
+  saved_hash=$(head -n 1 "$job_dir/codex-sha256")
+  [[ "$saved_hash" =~ ^[0-9a-f]{64}$ ]] \
+    || die "任务固定的 bridge 二进制哈希异常"
+  [[ "$saved_binary" == "$BRIDGE_CODEX" ]] \
+    || die "任务固定的 bridge 二进制路径异常"
+  actual_version=$(codex_version_of "$saved_binary") \
+    || die "任务固定的 bridge 二进制无法执行"
+  actual_hash=$(sha256sum -- "$saved_binary" | awk '{print $1}')
+  [[ "$actual_version" == "$saved_version" ]] \
+    || die "任务固定的 bridge 二进制版本发生变化"
+  [[ "$actual_hash" == "$saved_hash" ]] \
+    || die "任务固定的 bridge 二进制内容发生变化"
+  if { [[ ! -e "$BRIDGE_RESOURCES_MANIFEST" \
+          && ! -L "$BRIDGE_RESOURCES_MANIFEST" ]] \
+       || [[ ! -e "$BRIDGE_COMPANIONS_MANIFEST" \
+          && ! -L "$BRIDGE_COMPANIONS_MANIFEST" ]]; }; then
+    identify_current_vscode_codex
+    [[ "$CURRENT_VSCODE_HASH" == "$actual_hash" ]] \
+      || die "缺少固定 bridge resource，且当前 IDE 构建与任务不同"
+    ensure_bridge_resources "$CURRENT_VSCODE_CODEX" "$actual_hash"
+    ensure_bridge_companions "$CURRENT_VSCODE_CODEX" "$actual_hash"
+  fi
+  validate_bridge_resources "$actual_hash"
+  validate_bridge_companions "$actual_hash"
+  JOB_BRIDGE_VERSION="$actual_version"
+  JOB_BRIDGE_HASH="$actual_hash"
+}
+
+validate_bridge_against_current_vscode() {
+  identify_current_vscode_codex
+  [[ "$JOB_BRIDGE_VERSION" == "$CURRENT_VSCODE_VERSION" \
+     && "$JOB_BRIDGE_HASH" == "$CURRENT_VSCODE_HASH" ]] \
+    || die "当前 VS Code Codex 与任务固定的 bridge 构建不同"
+}
+
+read_attempt_session_id() {
+  local attempt_dir="$1"
+  require_private_root_file "$attempt_dir/session-id"
+  ATTEMPT_SESSION_ID=$(head -n 1 "$attempt_dir/session-id")
+  validate_session_id "$ATTEMPT_SESSION_ID"
+}
+
+assert_session_not_managed_elsewhere() {
+  local session_id="$1" allowed_job="${2:-}" file owner_job candidate
+  while IFS= read -r -d '' file; do
+    require_private_root_file "$file"
+    candidate=$(head -n 1 "$file")
+    [[ "$candidate" == "$session_id" ]] || continue
+    owner_job=$(dirname -- "$(dirname -- "$(dirname -- "$file")")")
+    [[ -n "$allowed_job" && "$owner_job" == "$allowed_job" ]] && continue
+    die "同一会话已经被另一个受管任务登记"
+  done < <(
+    find "$JOBS_ROOT" -mindepth 4 -maxdepth 4 -name session-id -print0
+  )
+}
+
+probe_lock_file() {
+  local file="$1" description="$2" fd
+  [[ -f "$file" && ! -L "$file" ]] || die "$description 不存在或类型异常"
+  [[ "$(stat -c '%u' "$file")" -eq 0 ]] || die "$description 不属于 root"
+  exec {fd}<"$file" || die "无法打开 $description"
+  if ! flock -n "$fd"; then
+    exec {fd}>&-
+    die "$description 正在被占用"
+  fi
+  flock -u "$fd"
+  exec {fd}>&-
+}
+
+probe_codex_writer_lock() {
+  local session_id="$1" file
+  validate_session_id "$session_id"
+  file="$CODEX_HOME/thread-writer-locks/$session_id.lock"
+  probe_optional_lock_file "$file" "Codex 内置 thread-writer-lock"
+}
+
+probe_managed_session_lock() {
+  local session_id="$1"
+  validate_session_id "$session_id"
+  probe_optional_lock_file "$SESSION_LOCK_DIR/$session_id.lock" "受管 session lock"
+}
+
+probe_optional_lock_file() {
+  local file="$1" description="$2"
+  if [[ ! -e "$file" && ! -L "$file" ]]; then
+    return
+  fi
+  probe_lock_file "$file" "$description"
+}
+
+create_rollout_snapshot() {
+  local source="$1" available required before_size after_size before_mtime after_mtime
+  local before_hash after_hash snapshot_hash tmp
+  before_size=$(stat -c '%s' "$source")
+  before_mtime=$(stat -c '%y' "$source")
+  available=$(df -B1 --output=avail "$DATA_ROOT" | awk 'NR == 2 {print $1}')
+  [[ "$before_size" =~ ^[0-9]+$ && "$available" =~ ^[0-9]+$ ]] \
+    || die "无法验证 rollout 快照空间"
+  (( ${#before_size} <= 18 && ${#available} <= 18 )) \
+    || die "rollout 快照空间数值超出安全范围"
+  required=$((10#$before_size + 536870912))
+  (( 10#$available >= required )) \
+    || die "数据盘空间不足，无法创建保守的 rollout 快照"
+  before_hash=$(sha256sum -- "$source" | awk '{print $1}')
+  tmp=$(mktemp "$RUN_DIR/.codexctl-rollout.XXXXXX") \
+    || die "无法创建 rollout 快照暂存文件"
+  TEMP_FILES+=("$tmp")
+  cp --reflink=auto --preserve=mode,timestamps -- "$source" "$tmp" 2>/dev/null \
+    || die "无法创建 rollout 只读快照"
+  chmod 0600 "$tmp"
+  sync -f "$tmp"
+  snapshot_hash=$(sha256sum -- "$tmp" | awk '{print $1}')
+  after_size=$(stat -c '%s' "$source")
+  after_mtime=$(stat -c '%y' "$source")
+  after_hash=$(sha256sum -- "$source" | awk '{print $1}')
+  [[ "$before_size" == "$after_size" && "$before_mtime" == "$after_mtime" \
+     && "$before_hash" == "$after_hash" && "$before_hash" == "$snapshot_hash" ]] \
+    || die "rollout 在快照期间发生变化；拒绝登记"
+  SNAPSHOT_TMP="$tmp"
+  SNAPSHOT_SHA256="$snapshot_hash"
+  SNAPSHOT_SIZE="$before_size"
+  SNAPSHOT_MTIME="$before_mtime"
+}
+
+validate_origin_snapshot() {
+  local job_dir="$1" expected_hash expected_size expected_mtime
+  local actual_hash actual_size actual_mtime
+  require_private_root_file "$job_dir/origin-rollout.jsonl"
+  require_private_root_file "$job_dir/origin-rollout.sha256"
+  require_private_root_file "$job_dir/origin-rollout.size"
+  require_private_root_file "$job_dir/origin-rollout.mtime"
+  expected_hash=$(head -n 1 "$job_dir/origin-rollout.sha256")
+  expected_size=$(head -n 1 "$job_dir/origin-rollout.size")
+  expected_mtime=$(head -n 1 "$job_dir/origin-rollout.mtime")
+  [[ "$expected_hash" =~ ^[0-9a-f]{64}$ && "$expected_size" =~ ^[0-9]+$ \
+     && "$expected_mtime" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?[[:space:]][+-][0-9]{4}$ ]] \
+    || die "origin rollout 快照元数据异常"
+  actual_size=$(stat -c '%s' "$job_dir/origin-rollout.jsonl")
+  [[ "$actual_size" == "$expected_size" ]] || die "origin rollout 快照大小校验失败"
+  actual_mtime=$(stat -c '%y' "$job_dir/origin-rollout.jsonl")
+  [[ "$actual_mtime" == "$expected_mtime" ]] || die "origin rollout 快照时间校验失败"
+  actual_hash=$(sha256sum -- "$job_dir/origin-rollout.jsonl" | awk '{print $1}')
+  [[ "$actual_hash" == "$expected_hash" ]] || die "origin rollout 快照内容校验失败"
+}
+
+validate_job_add_dirs() {
+  local job_dir="$1" sandbox add_root entry value resolved total
+  local -a entries=()
+  require_private_root_file "$job_dir/sandbox"
+  sandbox=$(head -n 1 "$job_dir/sandbox")
+  validate_sandbox "$sandbox"
+  add_root="$job_dir/add-dirs"
+  if [[ ! -e "$add_root" && ! -L "$add_root" ]]; then
+    return
+  fi
+  require_private_root_dir "$add_root"
+  mapfile -d '' -t entries < <(
+    find "$add_root" -mindepth 1 -maxdepth 1 -type f \
+      -name '[0-9][0-9][0-9][0-9]' -print0 | LC_ALL=C sort -z
+  )
+  total=$(find "$add_root" -mindepth 1 -maxdepth 1 -printf x | wc -c)
+  [[ "$total" =~ ^[0-9]+$ && "$total" -eq "${#entries[@]}" \
+     && ${#entries[@]} -le 32 ]] \
+    || die "任务附加写目录元数据异常"
+  ((${#entries[@]} == 0)) || [[ "$sandbox" == 'workspace-write' ]] \
+    || die "read-only 任务不能包含附加写目录"
+  for entry in "${entries[@]}"; do
+    require_private_root_file "$entry"
+    value=$(head -n 1 "$entry")
+    resolved=$(resolve_add_dir "$value")
+    [[ "$resolved" == "$value" ]] || die "任务附加写目录不是规范路径"
+  done
+}
+
+session_id_from_events() {
+  local events_file="$1" line candidate
+  local type_re='"type"[[:space:]]*:[[:space:]]*"thread\.started"'
+  local id_re='"thread_id"[[:space:]]*:[[:space:]]*"([0-9A-Fa-f-]+)"'
+  [[ -f "$events_file" ]] || return 1
+  while IFS= read -r line; do
+    [[ "$line" =~ $type_re ]] || continue
+    if [[ "$line" =~ $id_re ]]; then
+      candidate="${BASH_REMATCH[1]}"
+      if [[ "$candidate" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    fi
+  done <"$events_file"
+  return 1
+}
+
+latest_attempt() {
+  local job_dir="$1" result
+  result=$(
+    find "$job_dir/attempts" -mindepth 1 -maxdepth 1 -type d \
+      -name '[0-9][0-9][0-9][0-9]' -printf '%f\n' 2>/dev/null \
+      | LC_ALL=C sort | tail -n 1
+  )
+  [[ -n "$result" ]] || return 1
+  printf '%s\n' "$result"
+}
+
+new_attempt() {
+  local job_dir="$1" n=1 attempt_id attempt_dir
+  while (( n <= 9999 )); do
+    printf -v attempt_id '%04d' "$n"
+    attempt_dir="$job_dir/attempts/$attempt_id"
+    if mkdir -m 0700 -- "$attempt_dir" 2>/dev/null; then
+      printf '%s\n' "$attempt_dir"
+      return 0
+    fi
+    n=$((n + 1))
+  done
+  die "任务 attempt 已达到上限"
+}
+
+screen_tokens() {
+  local session="$1"
+  screen -ls 2>/dev/null \
+    | awk -v session="$session" '
+        {
+          token = $1
+          dot = index(token, ".")
+          if (dot > 1 && substr(token, dot + 1) == session) {
+            print token
+          }
+        }'
+}
+
+dead_screen_tokens() {
+  local session="$1"
+  screen -ls 2>/dev/null \
+    | awk -v session="$session" '
+        {
+          token = $1
+          dot = index(token, ".")
+          if (dot > 1 && substr(token, dot + 1) == session && $0 ~ /\(Dead \?\?\?\)/) {
+            print token
+          }
+        }'
+}
+
+purge_dead_screen() {
+  local session="$1" token
+  local -a all_tokens=() dead_tokens=()
+  mapfile -t all_tokens < <(screen_tokens "$session")
+  mapfile -t dead_tokens < <(dead_screen_tokens "$session")
+  [[ ${#all_tokens[@]} -gt 0 && ${#all_tokens[@]} -eq ${#dead_tokens[@]} ]] || return 1
+  for token in "${dead_tokens[@]}"; do
+    screen -wipe "$token" >/dev/null 2>&1 || true
+  done
+  [[ -z "$(screen_tokens "$session")" ]]
+}
+
+owned_screen_token() {
+  local session="$1" token pid expected actual found_session=0 found_runner=0 i
+  local -a tokens=() argv=()
+  mapfile -t tokens < <(screen_tokens "$session")
+  [[ ${#tokens[@]} -eq 1 ]] || return 1
+  token=${tokens[0]}
+  pid=${token%%.*}
+  [[ -r "/proc/$pid/status" ]] || return 1
+  expected=$(readlink -e -- "$(command -v screen)") || return 1
+  actual=$(readlink -e -- "/proc/$pid/exe" 2>/dev/null) || return 1
+  [[ "$actual" == "$expected" ]] || return 1
+  mapfile -d '' -t argv < "/proc/$pid/cmdline" 2>/dev/null || return 1
+  for ((i = 0; i < ${#argv[@]}; i++)); do
+    if [[ "${argv[i]}" == "-dmS" && "${argv[i+1]:-}" == "$session" ]]; then
+      found_session=1
+    fi
+    [[ "${argv[i]}" == "$RUNNER" ]] && found_runner=1
+  done
+  [[ "$found_session" -eq 1 && "$found_runner" -eq 1 ]] || return 1
+  printf '%s\n' "$token"
+}
+
+start_screen() {
+  local session="$1" attempt_dir="$2" job_name state i
+  shift 2
+  job_name=$(basename "$(dirname "$(dirname "$attempt_dir")")")
+  write_value "$session" "$attempt_dir/screen-name"
+  write_value 'launching' "$attempt_dir/state"
+  if ! screen -L -Logfile "$attempt_dir/screen.log" -dmS "$session" "$RUNNER" "$@" 8>&- 9>&-; then
+    write_value 'failed' "$attempt_dir/state"
+    write_value '1' "$attempt_dir/exit-code"
+    write_value "$(date -Is)" "$attempt_dir/ended-at"
+    die "无法启动任务 Screen"
+  fi
+  for i in {1..80}; do
+    if [[ -f "$attempt_dir/state" ]]; then
+      state=$(head -n 1 "$attempt_dir/state")
+      case "$state" in
+        running)
+          if owned_screen_token "$session" >/dev/null; then
+            printf 'started name=%s attempt=%s screen=%s\n' \
+              "$job_name" "$(basename "$attempt_dir")" "$session"
+            return 0
+          fi
+          ;;
+        completed)
+          printf 'completed name=%s attempt=%s\n' "$job_name" "$(basename "$attempt_dir")"
+          return 0
+          ;;
+        failed|interrupted)
+          printf '任务已退出，state=%s；查看日志：%s logs %s progress\n' \
+            "$state" "$0" "$job_name" >&2
+          return 1
+          ;;
+      esac
+    fi
+    sleep 0.25
+  done
+  state=$(head -n 1 "$attempt_dir/state" 2>/dev/null || true)
+  if owned_screen_token "$session" >/dev/null && [[ "$state" == 'starting' ]]; then
+    printf 'starting name=%s attempt=%s screen=%s\n' \
+      "$job_name" "$(basename "$attempt_dir")" "$session"
+    return 0
+  fi
+  if [[ -z "$(screen_tokens "$session")" \
+        && ( "$state" == 'launching' || "$state" == 'starting' ) ]]; then
+    write_value 'failed' "$attempt_dir/state"
+    write_value '1' "$attempt_dir/exit-code"
+    write_value "$(date -Is)" "$attempt_dir/ended-at"
+  fi
+  printf '无法在 20 秒内确认任务状态；查看：%s status %s\n' "$0" "$job_name" >&2
+  return 1
+}
+
+create_job() {
+  local name="$1" mode="$2" workdir="$3" sandbox="$4"
+  local job_dir="$JOBS_ROOT/$name"
+  [[ ! -e "$job_dir" && ! -L "$job_dir" ]] || die "任务已存在：$name"
+  install -d -m 0700 "$job_dir" "$job_dir/attempts"
+  write_value "$mode" "$job_dir/mode"
+  write_value "$workdir" "$job_dir/workdir"
+  write_value "$sandbox" "$job_dir/sandbox"
+  write_value "$(date -Is)" "$job_dir/created-at"
+  printf '%s\n' "$job_dir"
+}
+
+show_status() {
+  local name="$1"
+  local job_dir="$JOBS_ROOT/$name" attempt_id attempt_dir
+  local state='not-started' session='' token='' mode workdir sandbox
+  [[ -d "$job_dir" ]] || die "任务不存在：$name"
+  mode=$(head -n 1 "$job_dir/mode")
+  workdir=$(head -n 1 "$job_dir/workdir")
+  sandbox=$(head -n 1 "$job_dir/sandbox")
+  if attempt_id=$(latest_attempt "$job_dir"); then
+    attempt_dir="$job_dir/attempts/$attempt_id"
+    [[ -f "$attempt_dir/state" ]] && state=$(head -n 1 "$attempt_dir/state")
+    [[ -f "$attempt_dir/screen-name" ]] && session=$(head -n 1 "$attempt_dir/screen-name")
+    if [[ -n "$session" ]] && token=$(owned_screen_token "$session"); then
+      state='running'
+    else
+      [[ -n "$session" ]] && purge_dead_screen "$session" >/dev/null 2>&1 || true
+      if [[ -n "$session" && -n "$(screen_tokens "$session")" ]]; then
+        state='conflict'
+      elif [[ "$state" == "launching" || "$state" == "starting" || "$state" == "running" ]]; then
+        state='interrupted'
+      fi
+    fi
+  else
+    attempt_id='----'
+  fi
+  printf '%-24s %-8s %-12s sandbox=%-15s attempt=%s workdir=%s\n' \
+    "$name" "$mode" "$state" "$sandbox" "$attempt_id" "$workdir"
+}
+
+cmd_doctor() {
+  local compat='pending'
+  ensure_layout
+  select_codex_home
+  set_proxy_environment
+  "$MIHOMO_CTL" start >/dev/null
+  "$MIHOMO_CTL" health
+  "$CODEX_BIN" login status
+  printf 'codex=%s\n' "$("$CODEX_BIN" --version)"
+  printf 'codex_home=%s\n' "$CODEX_HOME"
+  printf 'data_root=%s\n' "$DATA_ROOT"
+  if [[ -f "$MIGRATED_HOME/.migration-complete" ]]; then
+    compat_symlink_is_ready && compat='ready'
+    printf 'codex_compat=%s\n' "$compat"
+  fi
+}
+
+cmd_tui() {
+  local name="${1:-}" workdir_arg="${2:-}" sandbox="${3:-workspace-write}"
+  local workdir job_dir attempt_dir session
+  [[ -n "$name" && -n "$workdir_arg" ]] || die "用法：codexctl tui NAME WORKDIR [sandbox]"
+  validate_name "$name"
+  validate_sandbox "$sandbox"
+  workdir=$(resolve_workdir "$workdir_arg")
+  ensure_layout
+  lock_control
+  job_dir=$(create_job "$name" 'tui' "$workdir" "$sandbox")
+  attempt_dir=$(new_attempt "$job_dir")
+  session="cx-${name}-$(basename "$attempt_dir")"
+  start_screen "$session" "$attempt_dir" tui "$attempt_dir" "$workdir" "$sandbox"
+}
+
+cmd_exec() {
+  local name="${1:-}" workdir_arg="${2:-}" prompt_arg="${3:-}"
+  local sandbox="${4:-read-only}" workdir prompt job_dir attempt_dir session
+  [[ -n "$name" && -n "$workdir_arg" && -n "$prompt_arg" ]] \
+    || die "用法：codexctl exec NAME WORKDIR PROMPT_FILE [sandbox]"
+  validate_name "$name"
+  validate_sandbox "$sandbox"
+  workdir=$(resolve_workdir "$workdir_arg")
+  git -C "$workdir" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+    || die "无头任务要求工作目录位于 Git 仓库"
+  prompt=$(validate_prompt "$prompt_arg")
+  ensure_layout
+  lock_control
+  job_dir=$(create_job "$name" 'exec' "$workdir" "$sandbox")
+  attempt_dir=$(new_attempt "$job_dir")
+  install -m 0600 -- "$prompt" "$attempt_dir/prompt.txt"
+  session="cx-${name}-$(basename "$attempt_dir")"
+  start_screen "$session" "$attempt_dir" exec "$attempt_dir" "$workdir" "$sandbox"
+}
+
+cmd_stage_vscode_title() {
+  local name="${1:-}" workdir_arg="${2:-}" thread_title="${3:-}" prompt_arg="${4:-}"
+  local sandbox='workspace-write' workdir prompt session_id job_dir attempt_dir add_dir entry existing
+  local -a add_dirs=()
+  [[ -n "$name" && -n "$workdir_arg" && -n "$thread_title" && -n "$prompt_arg" ]] \
+    || die "用法：codexctl stage-vscode-title NAME WORKDIR THREAD_TITLE PROMPT_FILE [sandbox] [--add-dir DIR ...]"
+  shift 4
+  if (($# > 0)) && [[ "$1" != '--add-dir' ]]; then
+    sandbox="$1"
+    shift
+  fi
+  while (($# > 0)); do
+    [[ "$1" == '--add-dir' && $# -ge 2 ]] \
+      || die "附加写目录参数必须使用 --add-dir DIR"
+    add_dir=$(resolve_add_dir "$2")
+    for existing in "${add_dirs[@]}"; do
+      [[ "$existing" != "$add_dir" ]] || die "不能重复登记同一个附加写目录"
+    done
+    add_dirs+=("$add_dir")
+    ((${#add_dirs[@]} <= 32)) || die "附加写目录不能超过 32 个"
+    shift 2
+  done
+  validate_name "$name"
+  validate_thread_title "$thread_title"
+  validate_sandbox "$sandbox"
+  ((${#add_dirs[@]} == 0)) || [[ "$sandbox" == 'workspace-write' ]] \
+    || die "read-only 模式不能使用 --add-dir"
+  workdir=$(resolve_workdir "$workdir_arg")
+  prompt=$(validate_prompt "$prompt_arg")
+  ensure_layout
+  lock_control
+  lock_migration_shared
+  select_codex_home
+  require_migrated_compat_symlink
+  [[ ! -e "$JOBS_ROOT/$name" && ! -L "$JOBS_ROOT/$name" ]] \
+    || die "任务已存在：$name"
+  session_id=$(session_id_from_exact_title "$thread_title") \
+    || die "无法按精确 THREAD_TITLE 唯一定位会话"
+  validate_session_id "$session_id"
+  validate_vscode_thread "$session_id"
+  [[ "$workdir" == "$THREAD_DB_CWD" || "$workdir" == "$THREAD_DB_CWD"/* ]] \
+    || die "WORKDIR 必须等于目标会话 cwd 或位于其子目录"
+  assert_session_not_managed_elsewhere "$session_id"
+  ensure_bridge_binary
+  probe_codex_writer_lock "$session_id"
+  create_rollout_snapshot "$THREAD_ROLLOUT_REAL"
+
+  job_dir=$(create_job "$name" 'vscode' "$workdir" "$sandbox")
+  write_value "$BRIDGE_BINARY_VALUE" "$job_dir/codex-bin"
+  write_value "$BRIDGE_VERSION_VALUE" "$job_dir/codex-version"
+  write_value "$BRIDGE_HASH_VALUE" "$job_dir/codex-sha256"
+  write_value 'vscode' "$job_dir/origin-source"
+  write_value "$THREAD_DB_CWD" "$job_dir/origin-cwd"
+  write_value "$THREAD_ORIGIN_CLI_VERSION" "$job_dir/origin-cli-version"
+  write_value "$THREAD_ROLLOUT_REAL" "$job_dir/origin-rollout.path"
+  if ((${#add_dirs[@]} > 0)); then
+    install -d -m 0700 "$job_dir/add-dirs"
+    for ((entry = 0; entry < ${#add_dirs[@]}; entry++)); do
+      printf -v add_dir '%04d' "$((entry + 1))"
+      write_value "${add_dirs[entry]}" "$job_dir/add-dirs/$add_dir"
+    done
+  fi
+  mv -T -- "$SNAPSHOT_TMP" "$job_dir/origin-rollout.jsonl"
+  TEMP_FILES[${#TEMP_FILES[@]}-1]=''
+  chmod 0600 "$job_dir/origin-rollout.jsonl"
+  write_value "$SNAPSHOT_SHA256" "$job_dir/origin-rollout.sha256"
+  write_value "$SNAPSHOT_SIZE" "$job_dir/origin-rollout.size"
+  write_value "$SNAPSHOT_MTIME" "$job_dir/origin-rollout.mtime"
+
+  attempt_dir=$(new_attempt "$job_dir")
+  install -m 0600 -- "$prompt" "$attempt_dir/prompt.txt"
+  write_value "$session_id" "$attempt_dir/session-id"
+  write_value 'staged' "$attempt_dir/state"
+  write_value "$(date -Is)" "$attempt_dir/staged-at"
+  sync -f "$job_dir"
+  printf 'staged name=%s attempt=%s version=%s\n' \
+    "$name" "$(basename "$attempt_dir")" "$BRIDGE_VERSION_VALUE"
+}
+
+validate_vscode_job_metadata() {
+  local job_dir="$1" origin_source origin_cwd origin_cli_version origin_rollout job_workdir
+  require_private_root_file "$job_dir/origin-source"
+  require_private_root_file "$job_dir/origin-cwd"
+  require_private_root_file "$job_dir/origin-cli-version"
+  require_private_root_file "$job_dir/origin-rollout.path"
+  origin_source=$(head -n 1 "$job_dir/origin-source")
+  [[ "$origin_source" == 'vscode' ]] || die "任务来源元数据异常"
+  origin_cwd=$(head -n 1 "$job_dir/origin-cwd")
+  origin_cwd=$(resolve_workdir "$origin_cwd")
+  origin_cli_version=$(head -n 1 "$job_dir/origin-cli-version")
+  origin_rollout=$(head -n 1 "$job_dir/origin-rollout.path")
+  require_private_root_file "$job_dir/workdir"
+  job_workdir=$(resolve_workdir "$(head -n 1 "$job_dir/workdir")")
+  [[ ( "$job_workdir" == "$origin_cwd" || "$job_workdir" == "$origin_cwd"/* ) \
+     && ( "$THREAD_DB_CWD" == "$origin_cwd" || "$THREAD_DB_CWD" == "$job_workdir" ) \
+     && -n "$origin_cli_version" \
+     && "$origin_rollout" == "$THREAD_ROLLOUT_REAL" ]] \
+    || die "目标会话的 Codex 元数据已经变化"
+  validate_job_bridge_binary "$job_dir"
+  validate_origin_snapshot "$job_dir"
+  validate_job_add_dirs "$job_dir"
+}
+
+cmd_start() {
+  local name="${1:-}" job_dir attempt_id attempt_dir mode state workdir sandbox session
+  [[ -n "$name" ]] || die "用法：codexctl start NAME"
+  [[ $# -eq 1 ]] || die "start 参数过多"
+  validate_name "$name"
+  ensure_layout
+  lock_control
+  lock_migration_shared
+  select_codex_home
+  require_migrated_compat_symlink
+  job_dir="$JOBS_ROOT/$name"
+  [[ -d "$job_dir" ]] || die "任务不存在：$name"
+  mode=$(head -n 1 "$job_dir/mode")
+  [[ "$mode" == 'vscode' ]] || die "start 仅支持 staged VS Code 任务"
+  attempt_id=$(latest_attempt "$job_dir") || die "任务没有 staged attempt"
+  attempt_dir="$job_dir/attempts/$attempt_id"
+  require_private_root_file "$attempt_dir/state"
+  state=$(head -n 1 "$attempt_dir/state")
+  [[ "$state" == 'staged' ]] || die "最新 attempt 不是 staged 状态"
+  [[ ! -e "$attempt_dir/screen-name" && ! -L "$attempt_dir/screen-name" ]] \
+    || die "staged attempt 已经存在 Screen 元数据"
+  read_attempt_session_id "$attempt_dir"
+  validate_vscode_thread "$ATTEMPT_SESSION_ID"
+  assert_session_not_managed_elsewhere "$ATTEMPT_SESSION_ID" "$job_dir"
+  validate_vscode_job_metadata "$job_dir"
+  probe_codex_writer_lock "$ATTEMPT_SESSION_ID"
+  workdir=$(resolve_workdir "$(head -n 1 "$job_dir/workdir")")
+  sandbox=$(head -n 1 "$job_dir/sandbox")
+  validate_sandbox "$sandbox"
+  session="cx-${name}-${attempt_id}"
+  start_screen "$session" "$attempt_dir" resume "$attempt_dir" "$workdir" "$sandbox"
+}
+
+cmd_resume() {
+  local name="${1:-}" prompt_arg="${2:-}"
+  local prompt job_dir attempt_id previous_dir attempt_dir session_id session mode workdir sandbox previous_session
+  [[ -n "$name" && -n "$prompt_arg" ]] || die "用法：codexctl resume NAME PROMPT_FILE"
+  [[ $# -eq 2 ]] || die "resume 参数数量无效"
+  validate_name "$name"
+  prompt=$(validate_prompt "$prompt_arg")
+  ensure_layout
+  lock_control
+  lock_migration_shared
+  job_dir="$JOBS_ROOT/$name"
+  [[ -d "$job_dir" ]] || die "任务不存在：$name"
+  select_codex_home
+  mode=$(head -n 1 "$job_dir/mode")
+  [[ "$mode" == 'exec' || "$mode" == 'vscode' ]] \
+    || die "resume 仅支持 exec 或 vscode 任务"
+  workdir=$(resolve_workdir "$(head -n 1 "$job_dir/workdir")")
+  sandbox=$(head -n 1 "$job_dir/sandbox")
+  validate_sandbox "$sandbox"
+  attempt_id=$(latest_attempt "$job_dir") || die "任务没有可恢复 attempt"
+  previous_dir="$job_dir/attempts/$attempt_id"
+  if [[ "$mode" == 'vscode' && -f "$previous_dir/state" \
+        && "$(head -n 1 "$previous_dir/state")" == 'staged' ]]; then
+    die "最新 attempt 仍是 staged；请使用 codexctl start NAME"
+  fi
+  if [[ -f "$previous_dir/screen-name" ]]; then
+    previous_session=$(head -n 1 "$previous_dir/screen-name")
+    if owned_screen_token "$previous_session" >/dev/null; then
+      die "上一次任务仍在运行；拒绝并发恢复同一会话"
+    fi
+    purge_dead_screen "$previous_session" >/dev/null 2>&1 || true
+    [[ -z "$(screen_tokens "$previous_session")" ]] \
+      || die "上一次任务存在同名但无法验证归属的 Screen；请先检查"
+  fi
+  if [[ ! -f "$previous_dir/session-id" ]]; then
+    session_id=$(session_id_from_events "$previous_dir/events.jsonl") \
+      || die "上一次任务尚未记录可恢复的会话 ID"
+    write_value "$session_id" "$previous_dir/session-id"
+  fi
+  read_attempt_session_id "$previous_dir"
+  session_id="$ATTEMPT_SESSION_ID"
+  probe_optional_lock_file "$job_dir/run.lock" "任务 run lock"
+  probe_optional_lock_file "$SESSION_LOCK_DIR/$session_id.lock" "受管 session lock"
+  if [[ "$mode" == 'vscode' ]]; then
+    require_migrated_compat_symlink
+    validate_vscode_thread "$session_id"
+    assert_session_not_managed_elsewhere "$session_id" "$job_dir"
+    validate_vscode_job_metadata "$job_dir"
+    probe_codex_writer_lock "$session_id"
+  fi
+  attempt_dir=$(new_attempt "$job_dir")
+  install -m 0600 -- "$prompt" "$attempt_dir/prompt.txt"
+  write_value "$session_id" "$attempt_dir/session-id"
+  session="cx-${name}-$(basename "$attempt_dir")"
+  start_screen "$session" "$attempt_dir" resume "$attempt_dir" "$workdir" "$sandbox"
+}
+
+cmd_ide_ready() {
+  local name="${1:-}" job_dir mode attempt_id attempt_dir state session exit_code ended_at
+  [[ -n "$name" ]] || die "用法：codexctl ide-ready NAME"
+  [[ $# -eq 1 ]] || die "ide-ready 参数过多"
+  validate_name "$name"
+  ensure_layout
+  lock_control
+  lock_migration_shared
+  select_codex_home
+  require_migrated_compat_symlink
+  job_dir="$JOBS_ROOT/$name"
+  [[ -d "$job_dir" ]] || die "任务不存在：$name"
+  mode=$(head -n 1 "$job_dir/mode")
+  [[ "$mode" == 'vscode' ]] || die "ide-ready 仅支持 VS Code 接管任务"
+  attempt_id=$(latest_attempt "$job_dir") || die "任务没有 attempt"
+  attempt_dir="$job_dir/attempts/$attempt_id"
+  require_private_root_file "$attempt_dir/state"
+  state=$(head -n 1 "$attempt_dir/state")
+  [[ "$state" == 'completed' || "$state" == 'failed' || "$state" == 'interrupted' ]] \
+    || die "任务尚未进入可交还 IDE 的终态"
+  require_private_root_file "$attempt_dir/exit-code"
+  require_private_root_file "$attempt_dir/ended-at"
+  exit_code=$(<"$attempt_dir/exit-code")
+  ended_at=$(<"$attempt_dir/ended-at")
+  [[ "$(wc -l < "$attempt_dir/exit-code")" -eq 1 \
+     && "$exit_code" =~ ^[0-9]{1,3}$ && 10#$exit_code -le 255 ]] \
+    || die "任务 exit-code 元数据异常"
+  [[ "$(wc -l < "$attempt_dir/ended-at")" -eq 1 \
+     && "$ended_at" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}([.][0-9]+)?[+-][0-9]{2}:[0-9]{2}$ ]] \
+    || die "任务 ended-at 元数据异常"
+  require_private_root_file "$attempt_dir/screen-name"
+  session=$(head -n 1 "$attempt_dir/screen-name")
+  [[ -z "$(screen_tokens "$session")" ]] || die "任务 Screen 仍存在"
+  read_attempt_session_id "$attempt_dir"
+  assert_session_not_managed_elsewhere "$ATTEMPT_SESSION_ID" "$job_dir"
+  validate_vscode_thread "$ATTEMPT_SESSION_ID"
+  validate_vscode_job_metadata "$job_dir"
+  validate_bridge_against_current_vscode
+  probe_managed_session_lock "$ATTEMPT_SESSION_ID"
+  probe_codex_writer_lock "$ATTEMPT_SESSION_ID"
+  printf 'ready name=%s version=%s\n' "$name" "$JOB_BRIDGE_VERSION"
+}
+
+cmd_list() {
+  local job_dir
+  ensure_layout
+  shopt -s nullglob
+  for job_dir in "$JOBS_ROOT"/*; do
+    [[ -d "$job_dir" ]] || continue
+    validate_name "$(basename "$job_dir")"
+    show_status "$(basename "$job_dir")"
+  done
+}
+
+cmd_status() {
+  local name="${1:-}"
+  ensure_layout
+  if [[ -z "$name" ]]; then
+    cmd_list
+    return
+  fi
+  validate_name "$name"
+  show_status "$name"
+}
+
+cmd_attach() {
+  local name="${1:-}" job_dir attempt_id attempt_dir session token mode
+  [[ -n "$name" ]] || die "用法：codexctl attach NAME"
+  [[ -t 0 && -t 1 ]] || die "attach 必须在交互式终端运行"
+  validate_name "$name"
+  ensure_layout
+  job_dir="$JOBS_ROOT/$name"
+  [[ -d "$job_dir" ]] || die "任务不存在：$name"
+  mode=$(head -n 1 "$job_dir/mode")
+  [[ "$mode" == 'tui' ]] || die "只有 tui 任务支持 attach"
+  attempt_id=$(latest_attempt "$job_dir") || die "任务没有 attempt"
+  attempt_dir="$job_dir/attempts/$attempt_id"
+  session=$(head -n 1 "$attempt_dir/screen-name")
+  token=$(owned_screen_token "$session") || die "Screen 不在运行或归属无法验证"
+  if screen -ls | awk -v token="$token" '$1 == token && $0 ~ /\(Attached\)/ {found=1} END {exit !found}'; then
+    exec screen -x "$token"
+  else
+    exec screen -r "$token"
+  fi
+}
+
+cmd_result() {
+  local name="${1:-}" job_dir attempt_id file
+  [[ -n "$name" ]] || die "用法：codexctl result NAME"
+  validate_name "$name"
+  ensure_layout
+  job_dir="$JOBS_ROOT/$name"
+  [[ -d "$job_dir" ]] || die "任务不存在：$name"
+  attempt_id=$(latest_attempt "$job_dir") || die "任务没有 attempt"
+  file="$job_dir/attempts/$attempt_id/final.md"
+  [[ -f "$file" ]] || die "最终回复尚不存在"
+  cat -- "$file"
+  printf '\n'
+}
+
+cmd_chat() {
+  local name="${1:-}" option="${2:-}" job_dir attempt_id attempt_dir events_file state_file follow=0
+  [[ -n "$name" ]] || die "用法：codexctl chat NAME [--follow]"
+  [[ $# -le 2 ]] || die "chat 参数过多"
+  validate_name "$name"
+  if [[ -n "$option" ]]; then
+    [[ "$option" == '--follow' ]] || die "chat 只接受 --follow"
+    follow=1
+  fi
+  ensure_layout
+  command -v python3 >/dev/null 2>&1 || die "缺少 python3"
+  job_dir="$JOBS_ROOT/$name"
+  [[ -d "$job_dir" ]] || die "任务不存在：$name"
+  attempt_id=$(latest_attempt "$job_dir") || die "任务没有 attempt"
+  attempt_dir="$job_dir/attempts/$attempt_id"
+  events_file="$attempt_dir/events.jsonl"
+  state_file="$attempt_dir/state"
+  require_private_root_file "$events_file"
+  require_private_root_file "$state_file"
+
+  python3 - "$events_file" "$state_file" "$follow" "$attempt_id" <<'PY'
+import json
+import sys
+import time
+from pathlib import Path
+
+events_path = Path(sys.argv[1])
+state_path = Path(sys.argv[2])
+follow = sys.argv[3] == "1"
+attempt_id = sys.argv[4]
+message_index = 0
+max_line_chars = 32 * 1024 * 1024
+bidi_controls = {
+    0x061C,
+    0x200E,
+    0x200F,
+    0x202A,
+    0x202B,
+    0x202C,
+    0x202D,
+    0x202E,
+    0x2066,
+    0x2067,
+    0x2068,
+    0x2069,
+}
+
+
+def terminal_safe(value):
+    result = []
+    for char in str(value):
+        code = ord(char)
+        if char in "\n\t":
+            result.append(char)
+        elif code < 0x20 or 0x7F <= code <= 0x9F or code in bidi_controls:
+            if code <= 0xFFFF:
+                result.append(f"\\u{code:04x}")
+            else:
+                result.append(f"\\U{code:08x}")
+        else:
+            result.append(char)
+    return "".join(result)
+
+
+def emit(obj):
+    global message_index
+    event_type = obj.get("type")
+    if event_type == "turn.started":
+        print(f"[attempt {attempt_id}] turn started", flush=True)
+    elif event_type == "turn.completed":
+        print(f"\n[attempt {attempt_id}] turn completed", flush=True)
+    elif event_type == "turn.failed":
+        detail = obj.get("message") or obj.get("error") or "unknown error"
+        print(f"\n[attempt {attempt_id}] turn failed: {terminal_safe(detail)}", flush=True)
+    elif event_type == "error":
+        detail = obj.get("message") or obj.get("error") or "unknown error"
+        print(f"\n[error] {terminal_safe(detail)}", flush=True)
+    elif event_type == "item.completed":
+        item = obj.get("item")
+        if not isinstance(item, dict) or item.get("type") != "agent_message":
+            return
+        text = item.get("text")
+        if isinstance(text, str) and text:
+            message_index += 1
+            print(f"\n[assistant {message_index}]\n{terminal_safe(text)}", flush=True)
+
+
+terminal_states = {"completed", "failed", "interrupted"}
+with events_path.open("r", encoding="utf-8") as handle:
+    while True:
+        position = handle.tell()
+        line = handle.readline()
+        if line:
+            if follow and not line.endswith("\n"):
+                handle.seek(position)
+                time.sleep(0.25)
+                continue
+            if len(line) > max_line_chars:
+                print("\n[warning] skipped oversized JSONL event", file=sys.stderr, flush=True)
+                continue
+            try:
+                emit(json.loads(line))
+            except json.JSONDecodeError:
+                print("\n[warning] skipped malformed JSONL event", file=sys.stderr, flush=True)
+            continue
+        if not follow:
+            break
+        try:
+            state = state_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            state = ""
+        if state in terminal_states:
+            break
+        time.sleep(0.5)
+PY
+}
+
+cmd_logs() {
+  local name="${1:-}" kind="${2:-progress}" job_dir attempt_id attempt_dir file
+  [[ -n "$name" ]] || die "用法：codexctl logs NAME [kind]"
+  validate_name "$name"
+  ensure_layout
+  job_dir="$JOBS_ROOT/$name"
+  [[ -d "$job_dir" ]] || die "任务不存在：$name"
+  attempt_id=$(latest_attempt "$job_dir") || die "任务没有 attempt"
+  attempt_dir="$job_dir/attempts/$attempt_id"
+  case "$kind" in
+    screen) file="$attempt_dir/screen.log" ;;
+    progress) file="$attempt_dir/progress.log" ;;
+    final) file="$attempt_dir/final.md" ;;
+    proxy) file="$attempt_dir/proxy-check.log" ;;
+    *) die "日志类型只能是 screen、progress、final 或 proxy" ;;
+  esac
+  [[ -f "$file" ]] || die "日志尚不存在：$kind"
+  tail -n 120 -- "$file"
+}
+
+cmd_stop() {
+  local name="${1:-}" job_dir attempt_id attempt_dir session token i
+  [[ -n "$name" ]] || die "用法：codexctl stop NAME"
+  validate_name "$name"
+  ensure_layout
+  lock_control
+  job_dir="$JOBS_ROOT/$name"
+  [[ -d "$job_dir" ]] || die "任务不存在：$name"
+  attempt_id=$(latest_attempt "$job_dir") || die "任务没有 attempt"
+  attempt_dir="$job_dir/attempts/$attempt_id"
+  session=$(head -n 1 "$attempt_dir/screen-name")
+  token=$(owned_screen_token "$session") || die "Screen 不在运行或归属无法验证"
+  screen -S "$token" -X quit
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    owned_screen_token "$session" >/dev/null 2>&1 || {
+      printf 'stopped name=%s attempt=%s\n' "$name" "$attempt_id"
+      return 0
+    }
+    sleep 0.5
+  done
+  die "Screen 在 5 秒内未退出；未发送 SIGKILL"
+}
+
+case "${1:-}" in
+  doctor) shift; cmd_doctor "$@" ;;
+  tui) shift; cmd_tui "$@" ;;
+  exec) shift; cmd_exec "$@" ;;
+  stage-vscode-title) shift; cmd_stage_vscode_title "$@" ;;
+  start) shift; cmd_start "$@" ;;
+  resume) shift; cmd_resume "$@" ;;
+  ide-ready) shift; cmd_ide_ready "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  list) shift; cmd_list "$@" ;;
+  result) shift; cmd_result "$@" ;;
+  chat) shift; cmd_chat "$@" ;;
+  attach) shift; cmd_attach "$@" ;;
+  logs) shift; cmd_logs "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  -h|--help|'') usage ;;
+  *) usage >&2; exit 2 ;;
+esac

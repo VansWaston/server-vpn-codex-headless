@@ -1,0 +1,3 @@
+proxies:
+  - name: DIRECT-SELF-TEST
+    type: direct

@@ -1,0 +1,14 @@
+home/config.yaml
+home/cache.db
+home/*.db
+home/providers/*
+!home/providers/.gitkeep
+secrets/*
+!secrets/.gitkeep
+run/*
+!run/.gitkeep
+logs/*
+!logs/.gitkeep
+*.bak
+*.bak.*
+*.previous
