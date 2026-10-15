@@ -22,7 +22,7 @@
 /root/autodl-tmp/codex-headless
 ```
 
-脚本还依赖 Bash、curl、GNU Screen、flock、Git 和兼容版本的 Codex CLI。换到其他用户、
+脚本还依赖 Bash、curl、GNU Screen、flock、Git 和兼容版本的 Codex CLI；Mihomo 节点管理另需 Python 3 和 PyYAML（`python3-yaml`）。换到其他用户、
 架构或目录前，应先参数化脚本中的固定路径并重新审计权限。
 
 ## 部署入口
@@ -38,6 +38,21 @@
 
 不要将本仓库中的模板直接复制到现有运行目录后盲目重启；先对比本机配置和版本，
 并保留可回滚副本。
+
+## 刷新订阅与切换代理节点
+
+在部署后的服务器目录中执行：
+
+```bash
+cd /workspace/mihomo-server
+./scripts/mihomoctl update
+./scripts/mihomoctl restart
+./scripts/mihomoctl nodes
+./scripts/mihomoctl node '从 nodes 输出复制的完整节点名称'
+./scripts/mihomoctl health
+```
+
+`node` 在服务运行时自动重启，`node --auto` 恢复全部节点自动测速选择。订阅更新优先直连、失败后尝试本地代理，并保留现有节点筛选。完整步骤和失败排查见 [Mihomo 操作说明](mihomo-server/README.md#刷新订阅和切换节点)。
 
 ## 不进入 Git 的内容
 

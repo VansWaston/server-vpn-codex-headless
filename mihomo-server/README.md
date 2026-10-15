@@ -32,7 +32,53 @@ cd /workspace/mihomo-server
 
 `set-url` 会无回显读取 URL。不要把 URL 写进 shell 命令、截图、工单或 Git。
 
-如果 `update` 报 provider 解析失败，说明链接可能返回 Base64/V2Ray 列表而不是 Clash YAML。应向订阅服务获取 Clash.Meta/Mihomo 兼容链接，不要把节点凭据交给在线订阅转换网站。
+`update` 优先直连下载订阅，失败后尝试本地代理，避免失效节点阻断订阅刷新。更新会保留现有 `home/config.yaml`（包括节点筛选和本地规则），并使用该配置校验新订阅；首次安装时才从模板生成配置。
+
+Mihomo 支持的订阅格式包括 Clash YAML 和兼容的 URI/Base64 节点列表。如果 `update` 报 provider 解析失败，应向订阅服务获取 Mihomo 兼容链接，不要把节点凭据交给在线订阅转换网站。
+
+## 刷新订阅和切换节点
+
+节点管理依赖 `python3` 和 PyYAML（系统包 `python3-yaml`）。当前服务器已经安装。
+
+刷新已保存的订阅并加载新节点：
+
+```bash
+cd /workspace/mihomo-server
+./scripts/mihomoctl update
+./scripts/mihomoctl restart
+./scripts/mihomoctl status
+./scripts/mihomoctl health
+```
+
+`update` 优先直连，失败后通过 `127.0.0.1:7890` 重试；下载或语法校验失败时保留原订阅。订阅地址变化时，先执行 `./scripts/mihomoctl set-url`，再刷新。刷新不会重置现有节点筛选；如果原来固定的节点已被服务商删除，请重新选择节点或使用 `node --auto`。
+
+列出全部节点，再复制完整名称切换（名称含空格或特殊符号时必须加引号）：
+
+```bash
+./scripts/mihomoctl nodes
+./scripts/mihomoctl node '[vless]🇺🇸+UnitedStates3+×1'
+./scripts/mihomoctl status
+./scripts/mihomoctl health
+```
+
+示例名称来自当前订阅，应以 `nodes` 输出为准。`node` 精确匹配完整名称，先隔离校验配置，再保存到 `home/config.yaml`。代理正在运行时自动重启；重启失败会恢复原配置并尝试恢复服务。代理停止时只保存选择，之后运行 `./scripts/mihomoctl start`。找不到名称时不会修改配置。
+
+取消固定节点，恢复全部订阅节点自动测速选择：
+
+```bash
+./scripts/mihomoctl node --auto
+```
+
+自动选择依据 Cloudflare 测试地址延迟，可能选到无法访问特定站点的节点。`status` 检查进程和监听状态，`health` 检查 HTTP CONNECT/SOCKS5 的 Cloudflare 请求；还应验证实际要访问的站点：
+
+```bash
+curl --proxy http://127.0.0.1:7890 --connect-timeout 10 --max-time 30 \
+  --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
+  https://chatgpt.com
+./scripts/mihomoctl logs
+```
+
+TLS EOF 或超时应结合日志排查节点连接；HTTP 403 表示请求收到站点拒绝响应，不能视为业务访问成功。可尝试另一个节点并再次验证。
 
 ## Shell 与任务使用代理
 
@@ -82,3 +128,9 @@ codexctl doctor
 mv /etc/profile.d/mihomo-login-autostart.sh \
   /etc/profile.d/mihomo-login-autostart.sh.disabled
 ```
+
+## 连接异常排查
+
+`curl: (35) ... unexpected eof while reading` 可能来自代理上游连接被中断。先运行 `./scripts/mihomoctl logs` 查看节点连接是否超时或被限流，再运行 `update` 和 `restart`。`health` 只验证 Cloudflare 测试地址，不能保证 ChatGPT 等目标站点可用。
+
+2026-10-15 排查后，活动配置暂时筛选 `UnitedStates3` 节点，避免其他已观察到超时或上游 429 的候选节点。原配置保存在 `home/config.before-network-fix.yaml`。后续节点变化时，使用 `nodes` 查看候选项，再用 `node` 切换；订阅更新会保留该筛选。
