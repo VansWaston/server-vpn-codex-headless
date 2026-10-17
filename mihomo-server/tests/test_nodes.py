@@ -1,5 +1,6 @@
 import base64
 import importlib.util
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -27,13 +28,21 @@ class NodeTests(unittest.TestCase):
 
     def test_commands_and_failed_validation_preserve_config(self):
         # Use the real Mihomo validator without starting any listener.
+        binary = Path(os.environ.get('MIHOMO_TEST_BIN', str(ROOT / 'bin/mihomo')))
+        if not binary.is_file():
+            self.skipTest('Set MIHOMO_TEST_BIN to a real Mihomo core for validator integration')
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory) / 'mihomo-server'
+            (root.parent / 'lib').mkdir()
+            (root.parent / 'lib/toolkit.sh').write_bytes((ROOT.parent / 'lib/toolkit.sh').read_bytes())
             for directory_name in ['scripts', 'bin', 'config', 'home/providers']:
                 (root / directory_name).mkdir(parents=True)
-            for filename in ['scripts/mihomoctl', 'scripts/nodes.py', 'config/config.template.yaml']:
+            for filename in ['scripts/mihomoctl', 'scripts/nodes.py', 'scripts/check-config.py', 'config/config.template.yaml']:
                 (root / filename).write_bytes((ROOT / filename).read_bytes())
-            (root / 'bin/mihomo').symlink_to(ROOT / 'bin/mihomo')
+            (root / 'bin/mihomo').symlink_to(binary.resolve())
+            env = {key: value for key, value in os.environ.items()
+                   if not key.startswith(('MIHOMO_', 'SERVER_TOOLKIT_'))}
+            env['MIHOMO_ROOT'] = str(root)
             config = root / 'home/config.yaml'
             config.write_bytes((ROOT / 'config/config.template.yaml').read_bytes())
             provider = root / 'home/providers/subscription.yaml'
@@ -42,7 +51,7 @@ class NodeTests(unittest.TestCase):
 
             def run(*args):
                 return subprocess.run(['bash', str(root / 'scripts/mihomoctl'), *args],
-                                      capture_output=True, text=True)
+                                      capture_output=True, text=True, env=env)
 
             self.assertEqual(run('nodes').stdout.strip(), name)
             result = run('node', name)
@@ -79,7 +88,7 @@ restart_unlocked() {
 with_control_lock switch_node test
 """
             result = subprocess.run(['bash', '-c', driver, 'test', str(root / 'scripts/mihomoctl')],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True, env=env)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual(config.read_bytes(), previous)
             self.assertTrue((root / 'run/recovery-attempt').exists())

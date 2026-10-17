@@ -5,11 +5,5 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   exit 1
 fi
 
-export HTTP_PROXY='http://127.0.0.1:7890'
-export HTTPS_PROXY='http://127.0.0.1:7890'
-export ALL_PROXY='socks5h://127.0.0.1:7890'
-export http_proxy="$HTTP_PROXY"
-export https_proxy="$HTTPS_PROXY"
-export all_proxy="$ALL_PROXY"
-export NO_PROXY='127.0.0.1,localhost,::1'
-export no_proxy="$NO_PROXY"
+source "$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)/lib/toolkit.sh" || return 1
+toolkit_set_proxy

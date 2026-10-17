@@ -3,9 +3,11 @@ set -Eeuo pipefail
 
 umask 077
 
-SOURCE='/root/.codex'
-DATA_MOUNT='/root/autodl-tmp'
-TARGET="$DATA_MOUNT/codex-home"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+source "$SCRIPT_DIR/../../lib/toolkit.sh"
+SOURCE="$CODEX_DEFAULT_HOME"
+DATA_MOUNT="$CODEX_HEADLESS_DATA_MOUNT"
+TARGET="$CODEX_MIGRATED_HOME"
 MIGRATION_MARKER="$TARGET/.migration-complete"
 COMPAT_MARKER="$TARGET/.compat-symlink-complete"
 MIGRATION_LOCK="$DATA_MOUNT/.codex-home-migration.lock"
@@ -34,7 +36,7 @@ safe_remove_temp() {
   local path=${1:-}
   [[ -n "$path" ]] || return 0
   case "$path" in
-    /tmp/codex-finalize.*|"$TARGET"/.rollout-merge.*|"$TARGET"/sessions/*/.rollout-merge.*|"$TARGET"/archived_sessions/*/.rollout-merge.*|"$TARGET"/.compat-marker.*|/root/.codex.link.*)
+    /tmp/codex-finalize.*|"$TARGET"/.rollout-merge.*|"$TARGET"/sessions/*/.rollout-merge.*|"$TARGET"/archived_sessions/*/.rollout-merge.*|"$TARGET"/.compat-marker.*|"$SOURCE".link.*)
       rm -f -- "$path" 2>/dev/null || true
       ;;
   esac
@@ -101,6 +103,7 @@ require_command() {
 count_codex_processes() {
   local proc executable count=0
   for proc in /proc/[0-9]*; do
+    [[ "$(stat -c '%u' "$proc" 2>/dev/null)" == "$TOOLKIT_UID" ]] || continue
     executable=$(readlink -e -- "$proc/exe" 2>/dev/null || true)
     if [[ "${executable##*/}" == 'codex' ]]; then
       count=$((count + 1))
@@ -120,26 +123,21 @@ validate_data_mount_and_marker() {
   local mount_target mount_source mount_type mount_options
   local target_mode target_uid target_gid marker_mode marker_uid marker_gid
 
-  read -r mount_target mount_source mount_type mount_options < <(
-    findmnt -rn -T "$DATA_MOUNT" -o TARGET,SOURCE,FSTYPE,OPTIONS
-  ) || die '无法确认数据盘挂载'
-  [[ "$mount_target" == "$DATA_MOUNT" ]] || die '数据盘挂载点异常'
-  [[ "$mount_type" != 'overlay' && ",$mount_options," == *,rw,* ]] \
-    || die '数据盘不是独立可写挂载'
+  toolkit_require_storage || die '状态存储检查失败'
 
   [[ -d "$TARGET" && ! -L "$TARGET" ]] || die '数据盘 Codex 目录不是实体目录'
   read -r target_mode target_uid target_gid < <(stat -c '%a %u %g' "$TARGET" 2>/dev/null) \
     || die '无法读取数据盘 Codex 目录权限'
-  [[ "$target_mode" == '700' && "$target_uid" == '0' && "$target_gid" == '0' ]] \
-    || die '数据盘 Codex 目录必须由 root 拥有且权限为 0700'
+  [[ "$target_mode" == '700' && "$target_uid" == "$TOOLKIT_UID" && "$target_gid" == "$TOOLKIT_GID" ]] \
+    || die '数据盘 Codex 目录必须由当前用户拥有且权限为 0700'
 
   [[ -f "$MIGRATION_MARKER" && ! -L "$MIGRATION_MARKER" ]] \
     || die '缺少有效的迁移完成标记'
   read -r marker_mode marker_uid marker_gid < <(stat -c '%a %u %g' "$MIGRATION_MARKER" 2>/dev/null) \
     || die '无法读取迁移完成标记权限'
-  [[ "$marker_mode" == '600' && "$marker_uid" == '0' && "$marker_gid" == '0' ]] \
+  [[ "$marker_mode" == '600' && "$marker_uid" == "$TOOLKIT_UID" && "$marker_gid" == "$TOOLKIT_GID" ]] \
     || die '迁移完成标记权限或所有者异常'
-  grep -Fxq 'source=/root/.codex' "$MIGRATION_MARKER" 2>/dev/null \
+  grep -Fxq "source=$SOURCE" "$MIGRATION_MARKER" 2>/dev/null \
     || die '迁移完成标记内容异常'
   grep -Eq '^completed_at=.+$' "$MIGRATION_MARKER" 2>/dev/null \
     || die '迁移完成标记不完整'
@@ -170,14 +168,15 @@ validate_completed_symlink() {
   [[ -f "$COMPAT_MARKER" && ! -L "$COMPAT_MARKER" ]] || die '缺少兼容完成标记'
   read -r marker_mode marker_uid marker_gid < <(stat -c '%a %u %g' "$COMPAT_MARKER" 2>/dev/null) \
     || die '无法读取兼容完成标记权限'
-  [[ "$marker_mode" == '600' && "$marker_uid" == '0' && "$marker_gid" == '0' ]] \
+  [[ "$marker_mode" == '600' && "$marker_uid" == "$TOOLKIT_UID" && "$marker_gid" == "$TOOLKIT_GID" ]] \
     || die '兼容完成标记权限或所有者异常'
   recorded_target=$(sed -n 's/^target=//p' "$COMPAT_MARKER" 2>/dev/null)
   recorded_rollback=$(sed -n 's/^rollback=//p' "$COMPAT_MARKER" 2>/dev/null)
   recorded_status=$(sed -n 's/^status=//p' "$COMPAT_MARKER" 2>/dev/null)
   [[ "$recorded_target" == "$TARGET" && "$recorded_status" == 'complete' ]] \
     || die '兼容完成标记内容异常'
-  [[ "$recorded_rollback" =~ ^/root/\.codex\.rollback\.[0-9]{8}T[0-9]{6}Z\.[0-9]+$ ]] \
+  [[ "$recorded_rollback" == "$SOURCE".rollback.* ]] \
+    && [[ "${recorded_rollback#"$SOURCE".rollback.}" =~ ^[0-9]{8}T[0-9]{6}Z\.[0-9]+$ ]] \
     || die '兼容完成标记中的回滚位置异常'
   [[ -d "$recorded_rollback" && ! -L "$recorded_rollback" ]] \
     || die '回滚目录缺失或类型异常'
@@ -437,7 +436,7 @@ install_compat_marker() {
   printf 'status=complete\ntarget=%s\nrollback=%s\ncompleted_at=%s\n' \
     "$TARGET" "$rollback_dir" "$(date -Is)" >"$marker_tmp"
   chmod 0600 "$marker_tmp" || die '无法设置兼容标记权限'
-  chown 0:0 "$marker_tmp" || die '无法设置兼容标记所有者'
+  chown "$TOOLKIT_UID:$TOOLKIT_GID" "$marker_tmp" || die '无法设置兼容标记所有者'
   sync -f "$marker_tmp" 2>/dev/null || die '无法同步兼容标记'
   mv -T -- "$marker_tmp" "$COMPAT_MARKER" 2>/dev/null \
     || die '无法原子安装兼容标记'
@@ -447,8 +446,8 @@ install_compat_marker() {
 }
 
 install_compat_symlink() {
-  rollback_dir="/root/.codex.rollback.$(date -u +%Y%m%dT%H%M%SZ).$$"
-  link_tmp="/root/.codex.link.$$"
+  rollback_dir="$SOURCE.rollback.$(date -u +%Y%m%dT%H%M%SZ).$$"
+  link_tmp="$SOURCE.link.$$"
   [[ ! -e "$rollback_dir" && ! -L "$rollback_dir" ]] || die '回滚位置已存在；拒绝覆盖'
   [[ ! -e "$link_tmp" && ! -L "$link_tmp" ]] || die '兼容入口临时位置已存在；拒绝覆盖'
 
@@ -462,14 +461,13 @@ install_compat_symlink() {
   mv -T -- "$link_tmp" "$SOURCE" 2>/dev/null || die '无法原子安装兼容入口'
   link_tmp=''
   link_installed=1
-  sync -f /root 2>/dev/null || die '无法同步兼容入口'
+  sync -f "$(dirname -- "$SOURCE")" 2>/dev/null || die '无法同步兼容入口'
 }
 
 main() {
   local source_inode target_inode lock_inode fd_inode
 
-  [[ "$(id -u)" -eq 0 ]] || die '必须以 root 运行'
-  for command_name in flock findmnt sqlite3 realpath stat cmp find sort mktemp install cp chmod chown touch sync mv ln readlink sed grep date rm unlink id; do
+  for command_name in flock sqlite3 realpath stat cmp find sort mktemp install cp chmod chown touch sync mv ln readlink sed grep date rm unlink id; do
     require_command "$command_name"
   done
 

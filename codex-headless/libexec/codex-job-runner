@@ -3,20 +3,22 @@ set -Eeuo pipefail
 
 umask 077
 
-BASE_DIR='/workspace/codex-headless'
-DATA_MOUNT='/root/autodl-tmp'
-DATA_ROOT="$DATA_MOUNT/codex-headless"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+source "$SCRIPT_DIR/../../lib/toolkit.sh"
+BASE_DIR="$SERVER_TOOLKIT_ROOT/codex-headless"
+DATA_MOUNT="$CODEX_HEADLESS_DATA_MOUNT"
+DATA_ROOT="$CODEX_HEADLESS_DATA_DIR"
 RUN_DIR="$DATA_ROOT/run"
 SESSION_LOCK_DIR="$RUN_DIR/session-locks"
 BRIDGE_CODEX="$DATA_ROOT/bridge-bin/codex"
 BRIDGE_RESOURCES_DIR="$DATA_ROOT/bridge-bin/codex-resources"
 BRIDGE_RESOURCES_MANIFEST="$DATA_ROOT/bridge-bin/codex-resources.sha256"
 BRIDGE_COMPANIONS_MANIFEST="$DATA_ROOT/bridge-bin/codex-companions.sha256"
-MIGRATED_HOME="$DATA_MOUNT/codex-home"
-DEFAULT_CODEX_HOME='/root/.codex'
+MIGRATED_HOME="$CODEX_MIGRATED_HOME"
+DEFAULT_CODEX_HOME="$CODEX_DEFAULT_HOME"
 MIGRATION_LOCK="$DATA_MOUNT/.codex-home-migration.lock"
-STABLE_CODEX_BIN='/root/.local/bin/codex'
-MIHOMO_CTL='/workspace/mihomo-server/scripts/mihomoctl'
+STABLE_CODEX_BIN="$CODEX_HEADLESS_BIN"
+MIHOMO_CTL="$SERVER_TOOLKIT_ROOT/mihomo-server/scripts/mihomoctl"
 
 die() {
   printf '错误：%s\n' "$*" >&2
@@ -31,18 +33,18 @@ write_value() {
   mv -f -- "$tmp" "$target"
 }
 
-require_private_root_file() {
+require_private_owned_file() {
   local file="$1" permissions
   [[ -f "$file" && ! -L "$file" ]] || die "私有任务文件不存在或类型异常"
-  [[ "$(stat -c '%u' "$file")" -eq 0 ]] || die "私有任务文件不属于 root"
+  [[ "$(stat -c '%u' "$file")" -eq "$TOOLKIT_UID" ]] || die "私有任务文件不属于当前用户"
   permissions=$(stat -c '%a' "$file")
   (( (8#$permissions & 0077) == 0 )) || die "私有任务文件权限过宽"
 }
 
-require_private_root_dir() {
+require_private_owned_dir() {
   local dir="$1" permissions
   [[ -d "$dir" && ! -L "$dir" ]] || die "私有任务目录不存在或类型异常"
-  [[ "$(stat -c '%u' "$dir")" -eq 0 ]] || die "私有任务目录不属于 root"
+  [[ "$(stat -c '%u' "$dir")" -eq "$TOOLKIT_UID" ]] || die "私有任务目录不属于当前用户"
   permissions=$(stat -c '%a' "$dir")
   (( (8#$permissions & 0077) == 0 )) || die "私有任务目录权限过宽"
 }
@@ -50,17 +52,17 @@ require_private_root_dir() {
 validate_bridge_resources() {
   local expected_codex_hash="$1" file entry_count actual_bwrap_hash actual_zsh_hash
   local -a lines=()
-  require_private_root_dir "$BRIDGE_RESOURCES_DIR"
-  require_private_root_dir "$BRIDGE_RESOURCES_DIR/zsh"
-  require_private_root_dir "$BRIDGE_RESOURCES_DIR/zsh/bin"
+  require_private_owned_dir "$BRIDGE_RESOURCES_DIR"
+  require_private_owned_dir "$BRIDGE_RESOURCES_DIR/zsh"
+  require_private_owned_dir "$BRIDGE_RESOURCES_DIR/zsh/bin"
   for file in "$BRIDGE_RESOURCES_DIR/bwrap" "$BRIDGE_RESOURCES_DIR/zsh/bin/zsh"; do
-    require_private_root_file "$file"
+    require_private_owned_file "$file"
     [[ -x "$file" ]] || die "bridge Codex resource 不可执行"
   done
   entry_count=$(find "$BRIDGE_RESOURCES_DIR" -mindepth 1 -printf x | wc -c)
   [[ "$entry_count" =~ ^[0-9]+$ && "$entry_count" -eq 4 ]] \
     || die "bridge Codex resource 目录包含意外条目"
-  require_private_root_file "$BRIDGE_RESOURCES_MANIFEST"
+  require_private_owned_file "$BRIDGE_RESOURCES_MANIFEST"
   mapfile -t lines < "$BRIDGE_RESOURCES_MANIFEST"
   [[ ${#lines[@]} -eq 3 \
      && "${lines[0]}" == "codex-sha256=$expected_codex_hash" \
@@ -77,7 +79,7 @@ validate_bridge_resources() {
 validate_bridge_companions() {
   local expected_codex_hash="$1" file path_count actual
   local -a lines=()
-  require_private_root_dir "$DATA_ROOT/bridge-bin/codex-path"
+  require_private_owned_dir "$DATA_ROOT/bridge-bin/codex-path"
   path_count=$(find "$DATA_ROOT/bridge-bin/codex-path" -mindepth 1 -printf x | wc -c)
   [[ "$path_count" =~ ^[0-9]+$ && "$path_count" -eq 1 ]] \
     || die "bridge Codex codex-path 包含意外条目"
@@ -86,13 +88,13 @@ validate_bridge_companions() {
     "$DATA_ROOT/bridge-bin/codex-package.json" \
     "$DATA_ROOT/bridge-bin/codex-path/rg" \
     "$DATA_ROOT/bridge-bin/rg"; do
-    require_private_root_file "$file"
+    require_private_owned_file "$file"
   done
   [[ -x "$DATA_ROOT/bridge-bin/codex-code-mode-host" \
      && -x "$DATA_ROOT/bridge-bin/codex-path/rg" \
      && -x "$DATA_ROOT/bridge-bin/rg" ]] \
     || die "bridge Codex companion 不可执行"
-  require_private_root_file "$BRIDGE_COMPANIONS_MANIFEST"
+  require_private_owned_file "$BRIDGE_COMPANIONS_MANIFEST"
   mapfile -t lines < "$BRIDGE_COMPANIONS_MANIFEST"
   [[ ${#lines[@]} -eq 5 \
      && "${lines[0]}" == "codex-sha256=$expected_codex_hash" \
@@ -120,8 +122,8 @@ resolve_add_dir() {
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] \
     || die "附加写目录不能包含换行符"
   resolved=$(realpath -e -- "$value") || die "附加写目录不存在"
-  [[ -d "$resolved" && "$resolved" == /workspace/* ]] \
-    || die "附加写目录必须是 /workspace 的现有子目录"
+  [[ -d "$resolved" && "$resolved" != / ]] && toolkit_workdir_allowed "$resolved" \
+    || die "附加写目录超出允许范围或不是现有目录"
   printf '%s\n' "$resolved"
 }
 
@@ -136,67 +138,41 @@ codex_version_of() {
 }
 
 resolve_stable_codex() {
-  local resolved source_home base relative release current component mode matched=0
-  local -a components=()
-  [[ -L "$STABLE_CODEX_BIN" && "$(stat -c '%u' "$STABLE_CODEX_BIN")" -eq 0 ]] \
-    || return 1
+  local resolved mode owner
   resolved=$(realpath -e -- "$STABLE_CODEX_BIN") || return 1
-  [[ -f "$resolved" && ! -L "$resolved" && -x "$resolved" ]] || return 1
-
-  for source_home in "$CODEX_HOME" "$DEFAULT_CODEX_HOME"; do
-    base=$(realpath -e -- "$source_home" 2>/dev/null || true)
-    [[ -n "$base" && ( "$resolved" == "$base"/* ) ]] || continue
-    relative=${resolved#"$base"/}
-    [[ "$relative" == packages/standalone/releases/*/bin/codex ]] || continue
-    release=${relative#packages/standalone/releases/}
-    release=${release%/bin/codex}
-    [[ -n "$release" && "$release" != */* ]] || continue
-
-    current="$base"
-    components=(packages standalone releases "$release" bin codex)
-    mode=$(stat -Lc '%a' "$current" 2>/dev/null) || return 1
-    (( (8#$mode & 0022) == 0 )) || return 1
-    for component in "${components[@]}"; do
-      current="$current/$component"
-      mode=$(stat -Lc '%a' "$current" 2>/dev/null) || return 1
-      (( (8#$mode & 0022) == 0 )) || return 1
-    done
-    [[ "$(realpath -e -- "$current")" == "$resolved" ]] || return 1
-    matched=1
-    break
-  done
-  (( matched == 1 )) || return 1
+  [[ -f "$resolved" && -x "$resolved" ]] || return 1
+  read -r mode owner < <(stat -c '%a %u' "$resolved") || return 1
+  [[ "$owner" == "$TOOLKIT_UID" || "$owner" == 0 ]] || return 1
+  (( (8#$mode & 0022) == 0 )) || return 1
   printf '%s\n' "$resolved"
 }
 
 require_data_mount() {
-  local target source fstype options
-  read -r target source fstype options < <(
-    findmnt -rn -T "$DATA_MOUNT" -o TARGET,SOURCE,FSTYPE,OPTIONS
-  ) || die "无法确认数据盘挂载"
-  [[ "$target" == "$DATA_MOUNT" ]] || die "数据盘挂载点异常：$target"
-  [[ "$fstype" != "overlay" && ",$options," == *,rw,* ]] \
-    || die "数据盘不是独立可写挂载"
+  toolkit_require_storage || die "状态存储检查失败"
 }
 
 select_codex_home() {
-  if [[ -f "$MIGRATED_HOME/.migration-complete" ]]; then
+  if [[ -n ${CODEX_HOME:-} ]]; then
+    export CODEX_HOME
+  elif [[ -f "$MIGRATED_HOME/.migration-complete" ]]; then
     export CODEX_HOME="$MIGRATED_HOME"
   else
     export CODEX_HOME="$DEFAULT_CODEX_HOME"
   fi
   [[ -d "$CODEX_HOME" ]] || die "CODEX_HOME 不存在：$CODEX_HOME"
-  [[ "$(stat -c '%u' "$CODEX_HOME")" -eq 0 ]] || die "CODEX_HOME 不属于 root"
+  [[ "$(stat -c '%u' "$CODEX_HOME")" -eq "$TOOLKIT_UID" ]] || die "CODEX_HOME 不属于当前用户"
 }
 
 require_migrated_compat_symlink() {
+  [[ -f "$MIGRATED_HOME/.migration-complete" ]] || return 0
+  [[ "$(realpath -e -- "$CODEX_HOME")" == "$(realpath -e -- "$MIGRATED_HOME")" ]] || return 0
   local marker="$MIGRATED_HOME/.compat-symlink-complete"
   local default_real migrated_real mode uid gid recorded_status recorded_target
   [[ -L "$DEFAULT_CODEX_HOME" && -f "$marker" && ! -L "$marker" ]] \
     || die "Codex 兼容链接或完成标记不存在"
   read -r mode uid gid < <(stat -c '%a %u %g' "$marker" 2>/dev/null) \
     || die "无法读取 Codex 兼容完成标记"
-  [[ "$mode" == '600' && "$uid" == '0' && "$gid" == '0' ]] \
+  [[ "$mode" == '600' && "$uid" == "$TOOLKIT_UID" && "$gid" == "$TOOLKIT_GID" ]] \
     || die "Codex 兼容完成标记权限或属主异常"
   recorded_status=$(sed -n 's/^status=//p' "$marker" 2>/dev/null) \
     || die "无法读取 Codex 兼容完成状态"
@@ -205,7 +181,7 @@ require_migrated_compat_symlink() {
   [[ "$recorded_status" == 'complete' && "$recorded_target" == "$MIGRATED_HOME" ]] \
     || die "Codex 兼容完成标记内容异常"
   default_real=$(realpath -e -- "$DEFAULT_CODEX_HOME") \
-    || die "/root/.codex 兼容链接无法解析"
+    || die "默认 CODEX_HOME 兼容链接无法解析"
   migrated_real=$(realpath -e -- "$MIGRATED_HOME") \
     || die "迁移后的 CODEX_HOME 无法解析"
   [[ "$default_real" == "$migrated_real" && "$CODEX_HOME" == "$MIGRATED_HOME" ]] \
@@ -219,8 +195,8 @@ probe_codex_writer_lock() {
   fi
   [[ -f "$file" && ! -L "$file" ]] \
     || die "Codex 内置 thread-writer-lock 类型异常"
-  [[ "$(stat -c '%u' "$file")" -eq 0 ]] \
-    || die "Codex 内置 thread-writer-lock 不属于 root"
+  [[ "$(stat -c '%u' "$file")" -eq "$TOOLKIT_UID" ]] \
+    || die "Codex 内置 thread-writer-lock 不属于当前用户"
   exec {fd}<"$file" || die "无法打开 Codex 内置 thread-writer-lock"
   if ! flock -n "$fd"; then
     exec {fd}>&-
@@ -237,7 +213,7 @@ load_job_add_dirs() {
   if [[ ! -e "$add_root" && ! -L "$add_root" ]]; then
     return
   fi
-  require_private_root_dir "$add_root"
+  require_private_owned_dir "$add_root"
   mapfile -d '' -t entries < <(
     find "$add_root" -mindepth 1 -maxdepth 1 -type f \
       -name '[0-9][0-9][0-9][0-9]' -print0 | LC_ALL=C sort -z
@@ -250,7 +226,7 @@ load_job_add_dirs() {
     || [[ "$JOB_MODE" == 'vscode' && "$SANDBOX" == 'workspace-write' ]] \
     || die "当前任务模式不能使用附加写目录"
   for entry in "${entries[@]}"; do
-    require_private_root_file "$entry"
+    require_private_owned_file "$entry"
     value=$(head -n 1 "$entry")
     resolved=$(resolve_add_dir "$value")
     [[ "$resolved" == "$value" ]] || die "任务附加写目录不是规范路径"
@@ -262,14 +238,7 @@ load_job_add_dirs() {
 }
 
 set_proxy_environment() {
-  export HTTP_PROXY='http://127.0.0.1:7890'
-  export HTTPS_PROXY="$HTTP_PROXY"
-  export ALL_PROXY='socks5h://127.0.0.1:7890'
-  export http_proxy="$HTTP_PROXY"
-  export https_proxy="$HTTPS_PROXY"
-  export all_proxy="$ALL_PROXY"
-  export NO_PROXY='127.0.0.1,localhost,::1'
-  export no_proxy="$NO_PROXY"
+  toolkit_set_proxy
 }
 
 ensure_proxy() {
@@ -365,8 +334,8 @@ trap 'record_signal HUP; exit 129' HUP
 
 WORKDIR_REAL=$(realpath -e -- "$WORKDIR") || die "无法解析工作目录"
 [[ "$WORKDIR_REAL" == "$WORKDIR" && -d "$WORKDIR" ]] || die "工作目录必须是规范目录"
-[[ "$WORKDIR" == '/workspace' || "$WORKDIR" == /workspace/* ]] \
-  || die "工作目录必须位于 /workspace"
+toolkit_workdir_allowed "$WORKDIR" \
+  || die "工作目录不在 CODEX_HEADLESS_WORKSPACE_ROOT 允许的范围内"
 [[ "$SANDBOX" == "read-only" || "$SANDBOX" == "workspace-write" ]] \
   || die "sandbox 无效"
 [[ -x "$MIHOMO_CTL" ]] || die "Mihomo 控制器不存在"
@@ -376,34 +345,34 @@ exec 7>"$JOB_LOCK"
 flock -n 7 || die "该任务已有一个运行实例；拒绝并发执行"
 if [[ -e "$MIGRATION_LOCK" || -L "$MIGRATION_LOCK" ]]; then
   [[ -f "$MIGRATION_LOCK" && ! -L "$MIGRATION_LOCK" \
-     && "$(stat -c '%u' "$MIGRATION_LOCK")" -eq 0 ]] \
+     && "$(stat -c '%u' "$MIGRATION_LOCK")" -eq "$TOOLKIT_UID" ]] \
     || die "迁移锁文件类型或属主异常"
 fi
 exec 8>>"$MIGRATION_LOCK"
 flock -s -w 15 8 || die "Codex 历史迁移正在进行；稍后重试"
 select_codex_home
 
-require_private_root_file "$JOB_DIR/workdir"
-require_private_root_file "$JOB_DIR/sandbox"
+require_private_owned_file "$JOB_DIR/workdir"
+require_private_owned_file "$JOB_DIR/sandbox"
 [[ "$(head -n 1 "$JOB_DIR/workdir")" == "$WORKDIR" ]] \
   || die "任务工作目录与 runner 参数不一致"
 [[ "$(head -n 1 "$JOB_DIR/sandbox")" == "$SANDBOX" ]] \
   || die "任务 sandbox 与 runner 参数不一致"
-require_private_root_file "$JOB_DIR/mode"
+require_private_owned_file "$JOB_DIR/mode"
 JOB_MODE=$(head -n 1 "$JOB_DIR/mode")
 case "$JOB_MODE" in
   vscode)
     [[ "$MODE" == 'resume' ]] || die "VS Code 接管任务只能以 resume 模式运行"
-    require_private_root_file "$JOB_DIR/codex-bin"
-    require_private_root_file "$JOB_DIR/codex-version"
-    require_private_root_file "$JOB_DIR/codex-sha256"
-    require_private_root_file "$JOB_DIR/origin-source"
+    require_private_owned_file "$JOB_DIR/codex-bin"
+    require_private_owned_file "$JOB_DIR/codex-version"
+    require_private_owned_file "$JOB_DIR/codex-sha256"
+    require_private_owned_file "$JOB_DIR/origin-source"
     [[ "$(head -n 1 "$JOB_DIR/origin-source")" == 'vscode' ]] \
       || die "VS Code 接管任务来源元数据异常"
     CODEX_BIN=$(head -n 1 "$JOB_DIR/codex-bin")
     [[ "$CODEX_BIN" == "$BRIDGE_CODEX" ]] || die "bridge Codex 路径异常"
     [[ -f "$CODEX_BIN" && ! -L "$CODEX_BIN" && -x "$CODEX_BIN" \
-       && "$(stat -c '%u' "$CODEX_BIN")" -eq 0 ]] \
+       && "$(stat -c '%u' "$CODEX_BIN")" -eq "$TOOLKIT_UID" ]] \
       || die "bridge Codex 类型异常"
     EXPECTED_CODEX_VERSION=$(head -n 1 "$JOB_DIR/codex-version")
     EXPECTED_CODEX_HASH=$(head -n 1 "$JOB_DIR/codex-sha256")
@@ -440,26 +409,26 @@ if [[ "$JOB_MODE" == 'vscode' ]]; then
 fi
 load_job_add_dirs
 if [[ "$MODE" == 'resume' ]]; then
-  require_private_root_file "$ATTEMPT_DIR/session-id"
+  require_private_owned_file "$ATTEMPT_DIR/session-id"
   SESSION_ID=$(head -n 1 "$ATTEMPT_DIR/session-id")
   [[ "$SESSION_ID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]] \
     || die "保存的会话 ID 格式异常"
 fi
 if [[ "$MODE" == 'exec' || "$MODE" == 'resume' ]]; then
-  require_private_root_file "$ATTEMPT_DIR/prompt.txt"
+  require_private_owned_file "$ATTEMPT_DIR/prompt.txt"
 fi
 
 if [[ "$JOB_MODE" == 'vscode' ]]; then
   require_migrated_compat_symlink
 fi
 if [[ "$MODE" == 'resume' ]]; then
-  require_private_root_dir "$SESSION_LOCK_DIR"
+  require_private_owned_dir "$SESSION_LOCK_DIR"
   SESSION_LOCK="$SESSION_LOCK_DIR/$SESSION_ID.lock"
   if [[ -e "$SESSION_LOCK" || -L "$SESSION_LOCK" ]]; then
     [[ -f "$SESSION_LOCK" && ! -L "$SESSION_LOCK" ]] \
       || die "受管 session lock 类型异常"
-    [[ "$(stat -c '%u' "$SESSION_LOCK")" -eq 0 ]] \
-      || die "受管 session lock 不属于 root"
+    [[ "$(stat -c '%u' "$SESSION_LOCK")" -eq "$TOOLKIT_UID" ]] \
+      || die "受管 session lock 不属于当前用户"
   fi
   exec 6>>"$SESSION_LOCK"
   chmod 0600 "$SESSION_LOCK"
@@ -486,13 +455,7 @@ case "$MODE" in
     ;;
   exec)
     args=(exec --cd "$WORKDIR")
-    if [[ "$SANDBOX" == "workspace-write" ]]; then
-      # --approve-for-me selects workspace-write itself and conflicts with an
-      # explicit --sandbox flag in bridge-enabled Codex builds.
-      args+=(--approve-for-me)
-    else
-      args+=(--sandbox "$SANDBOX")
-    fi
+    args+=(--sandbox "$SANDBOX")
     args+=(--json --color never -o "$FINAL_FILE")
     for add_dir in "${ADD_DIRS[@]}"; do
       args+=(--add-dir "$add_dir")
@@ -504,11 +467,7 @@ case "$MODE" in
     ;;
   resume)
     args=(exec --cd "$WORKDIR")
-    if [[ "$SANDBOX" == "workspace-write" ]]; then
-      args+=(--approve-for-me)
-    else
-      args+=(--sandbox "$SANDBOX")
-    fi
+    args+=(--sandbox "$SANDBOX")
     for add_dir in "${ADD_DIRS[@]}"; do
       args+=(--add-dir "$add_dir")
     done

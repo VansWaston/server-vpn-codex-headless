@@ -3,9 +3,11 @@ set -Eeuo pipefail
 
 umask 077
 
-BASE_DIR='/workspace/codex-headless'
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+source "$SCRIPT_DIR/../../lib/toolkit.sh"
+BASE_DIR="$SERVER_TOOLKIT_ROOT/codex-headless"
 CODEXCTL="$BASE_DIR/bin/codexctl"
-DATA_ROOT='/root/autodl-tmp/codex-headless'
+DATA_ROOT="$CODEX_HEADLESS_DATA_DIR"
 RUN_DIR="$DATA_ROOT/run"
 DEFAULT_TIMEOUT_SECONDS=43200
 POLL_SECONDS=10
@@ -37,7 +39,6 @@ timestamp() {
   date -Is
 }
 
-[[ "${EUID:-$(id -u)}" -eq 0 ]] || die '必须以 root 运行'
 [[ $# -eq 2 || $# -eq 3 ]] || {
   usage >&2
   exit 2
@@ -57,7 +58,7 @@ timeout_seconds="${3:-$DEFAULT_TIMEOUT_SECONDS}"
 
 prompt=$(realpath -e -- "$prompt_arg") || die '提示词文件不存在'
 [[ -f "$prompt" && ! -L "$prompt" && -r "$prompt" ]] || die '提示词必须是可读普通文件'
-[[ "$(stat -c '%u' "$prompt")" -eq 0 ]] || die '提示词文件不属于 root'
+[[ "$(stat -c '%u' "$prompt")" -eq "$TOOLKIT_UID" ]] || die '提示词文件不属于当前用户'
 prompt_mode=$(stat -c '%a' "$prompt")
 (( (8#$prompt_mode & 0077) == 0 )) || die '提示词文件权限过宽；必须仅属主可读'
 prompt_hash=$(sha256sum -- "$prompt" | awk '{print $1}')
@@ -71,7 +72,7 @@ probe_file="$RUN_DIR/.deferred-${name}-probe.$$"
 for private_file in "$log_file" "$state_file" "$lock_file"; do
   if [[ -e "$private_file" || -L "$private_file" ]]; then
     [[ -f "$private_file" && ! -L "$private_file" \
-       && "$(stat -c '%u' "$private_file")" -eq 0 ]] \
+       && "$(stat -c '%u' "$private_file")" -eq "$TOOLKIT_UID" ]] \
       || die '延迟恢复状态文件类型或属主异常'
   fi
 done

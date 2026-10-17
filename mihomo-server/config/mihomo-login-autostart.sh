@@ -1,10 +1,9 @@
-# Start the local-only Mihomo proxy on the first interactive root login.
-# This file is installed as /etc/profile.d/mihomo-login-autostart.sh.
+# Example Bash login hook. Prefer install.sh --shell-init for user installation.
 
 case $- in
   *i*)
-    if [ "$(id -u)" -eq 0 ] && [ -x /workspace/mihomo-server/scripts/ensure-running.sh ]; then
-      /workspace/mihomo-server/scripts/ensure-running.sh || true
+    if command -v mihomoctl >/dev/null 2>&1; then
+      mihomoctl start >/dev/null 2>&1 || true
     fi
     ;;
 esac

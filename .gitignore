@@ -1,4 +1,8 @@
 # Local/editor files
+__pycache__/
+*.pyc
+**/toolkit.env
+/dist/
 .DS_Store
 .idea/
 .vscode/
@@ -9,26 +13,21 @@
 .env
 .env.*
 !.env.example
-**/auth.json
+**/auth.json*
+**/subscription.curl
+**/subscription*.yaml
+**/home/config*.yaml
 **/*.key
 **/*.pem
 **/id_rsa*
 **/id_ed25519*
 
 # Mihomo binary, subscription, generated config, cache and runtime state
-/mihomo-server/bin/*
-!/mihomo-server/bin/.gitkeep
-/mihomo-server/home/config.yaml
-/mihomo-server/home/cache.db
-/mihomo-server/home/*.db
-/mihomo-server/home/providers/*
-!/mihomo-server/home/providers/.gitkeep
-/mihomo-server/secrets/*
-!/mihomo-server/secrets/.gitkeep
-/mihomo-server/run/*
-!/mihomo-server/run/.gitkeep
-/mihomo-server/logs/*
-!/mihomo-server/logs/.gitkeep
+/mihomo-server/bin/
+/mihomo-server/home/
+/mihomo-server/secrets/
+/mihomo-server/run/
+/mihomo-server/logs/
 core
 core.*
 *.bak
@@ -47,6 +46,7 @@ core.*
 **/session-id
 **/origin-rollout*
 **/prompt.txt
+**/final.md
 **/progress.log
 **/proxy-check.log
 **/screen.log

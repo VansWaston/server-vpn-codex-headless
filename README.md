@@ -1,73 +1,85 @@
-# 服务器 VPN 与 Codex 无头运行工具
+# 服务器代理与 Codex 无头任务
 
-本仓库保存当前服务器上可复用的两套运维工具：
+`mihomoctl` 管理服务器本机代理，`codexctl` 运行 SSH 断开后仍能继续的 Codex 任务。支持 Linux x86_64 / ARM64、Bash 4.4+、普通用户和 root，无需 systemd。
 
-- [Mihomo/Clash 服务端配置](mihomo-server/README.md)：仅监听
-  `127.0.0.1:7890`，通过 GNU Screen 常驻，并在首次 root 交互登录时自动恢复。
-- [Codex 无头任务工具](codex-headless/README.md)：让任务在 SSH 或 VS Code
-  断开后继续运行，并把事件流、最终回复和可恢复会话保存在数据盘。
+## 脚本入口
 
-日常切换、监控和恢复请直接看
-[《Codex 无头任务操作手册》](codex-headless/OPERATIONS.md)；完整 VPN 部署与迁移流程见
-[《服务器 Clash/Mihomo 部署复用手册》](mihomo-server/README.server-vpn.md)。
+| 入口 | 用途 | 说明 |
+| --- | --- | --- |
+| `./install.sh --help` | 安装、升级、查看安装参数 | 下方安装说明 |
+| `mihomoctl` | 启停代理、刷新订阅、切换节点 | [Mihomo 命令](mihomo-server/README.md#命令速查) |
+| `codexctl` | 登录、运行、恢复和查看任务 | [Codex 命令](codex-headless/README.md#命令速查) |
+| `bash scripts/check.sh` | 语法和离线集成测试 | 下方维护说明 |
+| `bash scripts/package.sh [输出路径]` | 生成可迁移安装包 | 下方维护说明 |
 
-## 适用环境
+## 安装
 
-当前版本面向单用户 `root`、AutoDL 风格目录布局的 Linux x86_64 容器，默认使用：
-
-```text
-/workspace/mihomo-server
-/workspace/codex-headless
-/root/autodl-tmp/codex-home
-/root/autodl-tmp/codex-headless
-```
-
-脚本还依赖 Bash、curl、GNU Screen、flock、Git 和兼容版本的 Codex CLI；Mihomo 节点管理另需 Python 3 和 PyYAML（`python3-yaml`）。换到其他用户、
-架构或目录前，应先参数化脚本中的固定路径并重新审计权限。
-
-## 部署入口
-
-1. 把仓库克隆到一个临时目录，不要直接覆盖正在运行的服务。
-2. 按 VPN 完整手册的“前置检查”和“下载并验证官方核心”章节安装依赖与
-   `mihomo-server/bin/mihomo`。仓库只记录固定版本及 SHA-256，不提交约 51 MB 的二进制。
-3. 将两个组件分别部署为 `/workspace/mihomo-server` 和
-   `/workspace/codex-headless`，保留文档指定的权限和兄弟目录关系。
-4. 使用 `mihomoctl set-url` 在终端无回显录入订阅，再完成 VPN 健康检查和登录自启。
-5. 按 Codex README 完成 `CODEX_HOME` 迁移、登录和 `codexctl doctor`，随后按操作手册
-   启动或接管任务。
-
-不要将本仓库中的模板直接复制到现有运行目录后盲目重启；先对比本机配置和版本，
-并保留可回滚副本。
-
-## 刷新订阅与切换代理节点
-
-在部署后的服务器目录中执行：
+Debian / Ubuntu 依赖：
 
 ```bash
-cd /workspace/mihomo-server
-./scripts/mihomoctl update
-./scripts/mihomoctl restart
-./scripts/mihomoctl nodes
-./scripts/mihomoctl node '从 nodes 输出复制的完整节点名称'
-./scripts/mihomoctl health
+sudo apt-get update
+sudo apt-get install -y bash ca-certificates curl gzip coreutils screen util-linux git python3 python3-yaml
 ```
 
-`node` 在服务运行时自动重启，`node --auto` 恢复全部节点自动测速选择。订阅更新优先直连、失败后尝试本地代理，并保留现有节点筛选。完整步骤和失败排查见 [Mihomo 操作说明](mihomo-server/README.md#刷新订阅和切换节点)。
+RHEL / Fedora 安装对应系统包，PyYAML 包名为 `python3-pyyaml`。VS Code 会话接管另需 `sqlite3`、`rg`；历史迁移另需 `rsync`。
 
-## 不进入 Git 的内容
+```bash
+git clone git@github.com:VansWaston/server-vpn-codex-headless.git
+cd server-vpn-codex-headless
+./install.sh --check
+./install.sh --shell-init
+export PATH="$HOME/.local/bin:$PATH"
+```
 
-本仓库有意不包含：
+以上使用已安装的 Codex CLI；若已有 Node.js / npm，可改用 `./install.sh --install-codex --shell-init`。需要固定 CLI 版本时增加 `--codex-version VERSION`。
 
-- VPN 订阅 URL、provider 节点、运行配置、缓存数据库、日志和 PID；
-- Codex 的 `auth.json`、聊天事件、会话 ID、提示词、最终回复、日志和任务状态；
-- Mihomo、Codex、VS Code bridge 等可执行二进制；
-- shell profile 的机器实装副本、私钥、令牌和 `.env` 文件。
+安装后按 [Mihomo 初始化步骤](mihomo-server/README.md#首次使用) 配置代理，再按 [Codex 示例](codex-headless/README.md#运行示例) 登录并运行任务。安装器保留已有核心；首次下载按架构选择固定的 Mihomo v1.19.30 并验证 SHA-256。
 
-这些内容均可能泄露凭据、代码或聊天记录。详细处理规则见 [SECURITY.md](SECURITY.md)。
-OpenAI 对无头执行、JSONL 输出、sandbox 和会话恢复的官方说明见
-[Non-interactive mode](https://learn.chatgpt.com/docs/non-interactive-mode)。
+## 安装目录与参数
 
-## 仓库性质
+| 参数 | 默认位置或行为 |
+| --- | --- |
+| `--prefix DIR` | 代码：`${XDG_DATA_HOME:-$HOME/.local/share}/server-vpn-codex-headless` |
+| `--bin-dir DIR` | 命令：`$HOME/.local/bin` |
+| `--state-dir DIR` | 私有数据父目录：`${XDG_STATE_HOME:-$HOME/.local/state}/server-vpn-codex-headless` |
+| `--mihomo-root DIR` | 代理数据：状态父目录下的 `mihomo-server`；也可接入已有目录 |
+| `--codex-bin FILE` | Codex CLI：从 PATH 查找 |
+| `--codex-home DIR` | 登录和历史：`$CODEX_HOME` 或 `$HOME/.codex` |
+| `--port PORT` / `--screen-name NAME` | 代理端口 `7890` / Screen 名 `mihomo-server` |
+| `--workspace-root DIR` | 可选工作目录范围，默认不限制位置 |
+| `--skip-core` | 离线安装；自行提供 `代理数据目录/bin/mihomo` |
+| `--shell-init` | 接入当前用户 `.bashrc`、`.profile`，保留备份 |
+| `--check` | 仅检查依赖和路径 |
 
-该仓库是当前服务器配置的私有灾备与复用基线，不是通用的一键安装器。提交前使用精确
-白名单打包；即使远端是私有仓库，也应始终把凭据和运行态数据留在 Git 之外。
+安装器不启动或重启代理，也不迁移 Codex 历史。已有服务可用 `--mihomo-root` 指向原目录，再按 [接入条件](mihomo-server/README.md#接入已有代理) 验证；端口和 Screen 名须与现有服务一致。
+
+## 运行配置
+
+机器配置保存在安装目录 `toolkit.env`，权限为 0600；环境变量优先于文件默认值。代码、代理数据、任务数据和登录目录分别存放，默认运行数据不会写入源码目录。
+
+| 变量 | 用途 |
+| --- | --- |
+| `MIHOMO_ROOT` / `MIHOMO_PORT` / `MIHOMO_SCREEN_NAME` | 代理运行目录、端口和 Screen 名；端口须与活动配置一致 |
+| `CODEX_HEADLESS_BIN` / `CODEX_DEFAULT_HOME` | CLI 路径和默认登录/会话目录；显式 `CODEX_HOME` 优先 |
+| `CODEX_HEADLESS_DATA_DIR` | 任务、日志和结果目录 |
+| `CODEX_HEADLESS_WORKSPACE_ROOT` | 工作目录允许范围 |
+| `CODEX_HEADLESS_DATA_MOUNT` / `CODEX_HEADLESS_REQUIRE_MOUNT` | 状态父目录；默认不要求独立挂载，设为 1 时才检查 |
+| `CODEX_VSCODE_EXTENSIONS` | 可选 IDE 接管使用的扩展目录，默认 `~/.vscode-server/extensions` |
+| `CODEX_MIGRATED_HOME` | 可选历史迁移目标 |
+
+登录自启由安装目录 `shell-init.sh` 调用代理恢复脚本；这是首次交互登录恢复。无人登录时启动，可把恢复脚本接入服务器现有启动命令。手动 source `shell-init.sh` 也会加载当前 shell 的代理变量并尝试恢复代理。
+
+## 升级、验证与打包
+
+```bash
+git pull --ff-only
+./install.sh
+# 自定义安装目录：./install.sh --prefix /path/to/installed-tools
+bash scripts/check.sh
+MIHOMO_TEST_BIN=/path/to/mihomo bash scripts/check.sh
+bash scripts/package.sh
+```
+
+升级沿用已有安装配置，保留运行数据，不自动重启服务。未设置 `MIHOMO_TEST_BIN` 时跳过真实核心测试，其余测试使用离线 CLI；设置后增加隔离端口的真实核心验证。
+
+发布包位于 `dist/server-vpn-codex-headless.tar.gz`，解压后可运行 `install.sh`，无需 Git 元数据。打包仅包含 `packaging-files.txt` 白名单中的源码、文档和测试。凭据及运行数据处理见 [SECURITY.md](SECURITY.md)。

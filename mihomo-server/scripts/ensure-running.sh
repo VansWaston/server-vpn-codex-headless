@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -uo pipefail
 
-BASE_DIR='/workspace/mihomo-server'
-CTL="$BASE_DIR/scripts/mihomoctl"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+source "$SCRIPT_DIR/../../lib/toolkit.sh" || exit 1
+BASE_DIR="$MIHOMO_ROOT"
+CTL="$SCRIPT_DIR/mihomoctl"
 RUN_DIR="$BASE_DIR/run"
 LOG_DIR="$BASE_DIR/logs"
 LOCK_FILE="$RUN_DIR/login-autostart.lock"

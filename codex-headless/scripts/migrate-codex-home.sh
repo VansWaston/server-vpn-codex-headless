@@ -3,14 +3,17 @@ set -Eeuo pipefail
 
 umask 077
 
-SOURCE='/root/.codex'
-DATA_MOUNT='/root/autodl-tmp'
-TARGET="$DATA_MOUNT/codex-home"
-STAGE="$DATA_MOUNT/codex-home.stage"
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+source "$SCRIPT_DIR/../../lib/toolkit.sh"
+SOURCE="$CODEX_DEFAULT_HOME"
+DATA_MOUNT="$CODEX_HEADLESS_DATA_MOUNT"
+TARGET="$CODEX_MIGRATED_HOME"
+STAGE="$TARGET.stage"
 MARKER='.migration-complete'
 MIGRATION_LOCK="$DATA_MOUNT/.codex-home-migration.lock"
-CODEX_LINK='/root/.local/bin/codex'
+CODEX_LINK="$CODEX_HEADLESS_BIN"
 CODEX_LINK_TMP="$CODEX_LINK.migration.$$"
+link_needs_update=0
 stage_created=0
 diff_file=''
 
@@ -25,7 +28,7 @@ cleanup() {
   [[ -z "$diff_file" ]] || rm -f -- "$diff_file"
   rm -f -- "$CODEX_LINK_TMP"
   if (( rc != 0 && stage_created == 1 )) \
-    && [[ "$STAGE" == '/root/autodl-tmp/codex-home.stage' ]] \
+    && [[ "$STAGE" == "$TARGET.stage" ]] \
     && [[ -d "$STAGE" && ! -e "$TARGET" ]]; then
     printf '正在清理本次失败产生的暂存副本。\n' >&2
     rm -rf --one-file-system -- "$STAGE"
@@ -39,6 +42,7 @@ trap cleanup EXIT
 count_codex_processes() {
   local proc executable count=0
   for proc in /proc/[0-9]*; do
+    [[ "$(stat -c '%u' "$proc" 2>/dev/null)" == "$TOOLKIT_UID" ]] || continue
     executable=$(readlink -e -- "$proc/exe" 2>/dev/null || true)
     if [[ "${executable##*/}" == 'codex' ]]; then
       count=$((count + 1))
@@ -54,22 +58,21 @@ require_no_codex_processes() {
     || die "检测到 $count 个 Codex 进程；请先完全退出 Codex、VS Code Codex 和 Screen 任务"
 }
 
-[[ "$(id -u)" -eq 0 ]] || die "必须以 root 运行"
 command -v rsync >/dev/null 2>&1 || die "缺少 rsync"
 command -v flock >/dev/null 2>&1 || die "缺少 flock"
 [[ -d "$SOURCE" ]] || die "源 CODEX_HOME 不存在"
-[[ -L "$CODEX_LINK" ]] || die "Codex CLI 安装链接不存在：$CODEX_LINK"
-codex_link_target=$(readlink -- "$CODEX_LINK") || die "无法读取 Codex CLI 安装链接"
-[[ "$codex_link_target" == "$SOURCE/"* ]] \
-  || die "Codex CLI 安装链接不在源 CODEX_HOME 中；拒绝猜测迁移路径"
-codex_link_relative=${codex_link_target#"$SOURCE/"}
-
-read -r mount_target mount_source mount_type mount_options < <(
-  findmnt -rn -T "$DATA_MOUNT" -o TARGET,SOURCE,FSTYPE,OPTIONS
-) || die "无法确认数据盘挂载"
-[[ "$mount_target" == "$DATA_MOUNT" ]] || die "数据盘挂载点异常"
-[[ "$mount_type" != "overlay" && ",$mount_options," == *,rw,* ]] \
-  || die "数据盘不是独立可写挂载"
+[[ ! -L "$SOURCE" && "$(stat -c '%u' "$SOURCE")" == "$TOOLKIT_UID" ]] \
+  || die "源 CODEX_HOME 必须是当前用户拥有的实体目录"
+[[ "$SOURCE" != "$TARGET" && "$TARGET" != "$SOURCE"/* && "$SOURCE" != "$TARGET"/* ]] \
+  || die "源和目标不能相同或互相嵌套"
+if [[ -L "$CODEX_LINK" ]]; then
+  codex_link_target=$(realpath -e -- "$CODEX_LINK") || die "无法解析 Codex CLI 链接"
+  if [[ "$codex_link_target" == "$SOURCE/"* ]]; then
+    codex_link_relative=${codex_link_target#"$SOURCE/"}
+    link_needs_update=1
+  fi
+fi
+toolkit_require_storage || die "状态存储检查失败"
 
 exec 8>"$MIGRATION_LOCK"
 flock -n 8 || die "有无头 Codex 任务正在运行，或另一迁移正在进行"
@@ -95,9 +98,10 @@ diff_file=$(mktemp "$DATA_MOUNT/codex-migrate-diff.XXXXXX")
 
 printf '正在复制 Codex 状态；不会输出会话内容或文件名。\n'
 rsync -aHAX --numeric-ids --one-file-system "$SOURCE/" "$STAGE/"
-[[ -x "$STAGE/$codex_link_relative" ]] \
-  || die "迁移副本中缺少独立 Codex CLI"
-ln -s -- "$TARGET/$codex_link_relative" "$CODEX_LINK_TMP"
+if (( link_needs_update )); then
+  [[ -x "$STAGE/$codex_link_relative" ]] || die "迁移副本中缺少独立 Codex CLI"
+  ln -s -- "$TARGET/$codex_link_relative" "$CODEX_LINK_TMP"
+fi
 
 source_count=$(find "$SOURCE" -xdev -type f -printf '.' | wc -c)
 target_count=$(find "$STAGE" -xdev -type f -printf '.' | wc -c)
@@ -124,13 +128,15 @@ sync -f "$STAGE"
 mv -T -- "$STAGE" "$TARGET"
 stage_created=0
 chmod 0700 "$TARGET"
-mv -Tf -- "$CODEX_LINK_TMP" "$CODEX_LINK"
+if (( link_needs_update )); then
+  mv -Tf -- "$CODEX_LINK_TMP" "$CODEX_LINK"
+fi
 sync -f "$DATA_MOUNT"
 
 printf '迁移副本已完成：%s\n' "$TARGET"
 printf '原目录仍保留用于回滚：%s\n' "$SOURCE"
-printf 'Codex CLI 链接已切换到数据盘副本。\n'
+(( link_needs_update == 0 )) || printf 'Codex CLI 链接已切换到迁移副本。\n'
 printf '现在不要重连 VS Code：旧会话索引仍可能引用原目录的绝对路径。\n'
 printf '下一步请保持所有 Codex 进程退出并运行：\n'
-printf '  /workspace/codex-headless/scripts/finalize-codex-home.sh\n'
+printf '  %q\n' "$SCRIPT_DIR/finalize-codex-home.sh"
 printf '最终化成功后，再打开新登录 shell并运行 codexctl doctor。\n'

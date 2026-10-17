@@ -1,136 +1,80 @@
-# 服务器端 Clash/Mihomo
+# Mihomo 服务器代理
 
-这套目录用于无图形界面的 Linux 容器。它运行 FLClash 所使用的兼容核心 Mihomo，而不是安装 Flutter/GTK 图形界面。
+管理仅监听 `127.0.0.1` 的 HTTP/SOCKS5 代理，核心通过 GNU Screen 常驻。安装及通用参数见 [根目录说明](../README.md)。
 
-## 当前安全边界
+## 命令速查
 
-- 混合 HTTP/SOCKS 代理只监听 `127.0.0.1:7890`。
-- 不开启 `allow-lan`、外部控制 API、TUN、透明代理或系统全局代理。
-- 订阅仅作为 `proxy-provider` 载入，不能覆盖本地监听地址、开启 TUN 或替换本地规则。
-- 订阅 URL 保存在权限为 `0600` 的 curl 配置中，不出现在进程参数和普通日志里。
-- 下载内容先在临时目录用 `mihomo -t` 校验，通过后才原子替换；旧 provider 留作 `subscription.yaml.previous`。
+| 命令 | 作用 |
+| --- | --- |
+| `mihomoctl set-url` | 在交互终端无回显保存 HTTPS 订阅地址 |
+| `mihomoctl update` | 先直连、失败后经本机代理下载并校验订阅；加载更新需再执行 `restart` |
+| `mihomoctl start` | 启动服务；健康实例存在时保持运行 |
+| `mihomoctl stop` | 停止受管进程并清理 PID、Screen |
+| `mihomoctl restart` | 在同一控制锁内停止并重新启动 |
+| `mihomoctl status` | 检查进程、监听和 Screen 归属 |
+| `mihomoctl health` | 验证 HTTP CONNECT 与 SOCKS5h 均返回 204 |
+| `mihomoctl nodes` | 列出订阅中的完整节点名称 |
+| `mihomoctl node '节点全名'` | 精确选择节点；运行中自动重启，失败恢复原配置 |
+| `mihomoctl node --auto` | 恢复全部订阅节点自动测速选择 |
+| `mihomoctl test` | 校验活动配置及本机监听策略 |
+| `mihomoctl logs` | 查看最近 80 行运行日志 |
+| `mihomoctl version` | 查看核心版本 |
 
-## 登录自动启动
+辅助脚本位于安装目录 `mihomo-server/scripts/`：
 
-Mihomo 运行在名为 `mihomo-server` 的 GNU Screen 会话中，SSH 或本地连接断开后仍会继续运行。
+| 脚本 | 使用方式 |
+| --- | --- |
+| `ensure-running.sh` | 确认服务运行；用于登录或服务器启动命令 |
+| `proxy-env.sh` | 用 `source` 加载当前 shell 的代理变量 |
+| `proxy-env-unset.sh` | 用 `source` 清除当前 shell 的代理变量 |
+| `install-core.sh` | 下载并校验固定版本核心；已有核心会保留 |
 
-系统已安装 `/etc/profile.d/mihomo-login-autostart.sh`。如果容器重启导致代理消失，首次交互式 root 登录会调用 `scripts/ensure-running.sh` 自动恢复。脚本使用 `flock` 防止多个并发登录重复启动，失败信息记录在 `logs/login-autostart.log`，不会阻断登录。
-
-这是“首次登录后自启”，不是无人登录时的开机服务；当前容器的 PID 1 不是 systemd。如需开机后、登录前启动，应另接 AutoDL 的实例启动命令。
-
-若服务器异常中断留下精确名为 `mihomo-server` 的 `(Dead ???)` Screen，控制器会在确认没有受管 Mihomo 进程、没有 7890 监听者后清理该死会话，再重新启动；不会清理其他 Screen。
-
-## 接入或更新订阅
-
-```bash
-cd /workspace/mihomo-server
-./scripts/mihomoctl set-url
-./scripts/mihomoctl update
-./scripts/mihomoctl restart
-./scripts/mihomoctl status
-```
-
-`set-url` 会无回显读取 URL。不要把 URL 写进 shell 命令、截图、工单或 Git。
-
-`update` 优先直连下载订阅，失败后尝试本地代理，避免失效节点阻断订阅刷新。更新会保留现有 `home/config.yaml`（包括节点筛选和本地规则），并使用该配置校验新订阅；首次安装时才从模板生成配置。
-
-Mihomo 支持的订阅格式包括 Clash YAML 和兼容的 URI/Base64 节点列表。如果 `update` 报 provider 解析失败，应向订阅服务获取 Mihomo 兼容链接，不要把节点凭据交给在线订阅转换网站。
-
-## 刷新订阅和切换节点
-
-节点管理依赖 `python3` 和 PyYAML（系统包 `python3-yaml`）。当前服务器已经安装。
-
-刷新已保存的订阅并加载新节点：
+## 首次使用
 
 ```bash
-cd /workspace/mihomo-server
-./scripts/mihomoctl update
-./scripts/mihomoctl restart
-./scripts/mihomoctl status
-./scripts/mihomoctl health
+mihomoctl set-url
+mihomoctl update
+mihomoctl start
+mihomoctl health
 ```
 
-`update` 优先直连，失败后通过 `127.0.0.1:7890` 重试；下载或语法校验失败时保留原订阅。订阅地址变化时，先执行 `./scripts/mihomoctl set-url`，再刷新。刷新不会重置现有节点筛选；如果原来固定的节点已被服务商删除，请重新选择节点或使用 `node --auto`。
+刷新保留活动配置和节点筛选；旧订阅保存为 `subscription.yaml.previous`。下载内容在隔离目录中校验，通过后原子安装。订阅作为 provider 使用，不能覆盖本地监听和路由策略。
 
-列出全部节点，再复制完整名称切换（名称含空格或特殊符号时必须加引号）：
+节点名称含空格或特殊符号时加引号。代理停止时，`node` 只保存选择；启动后生效。`--auto` 依据测试地址延迟选节点。
+
+## 接入已有代理
+
+安装时用 `--mihomo-root DIR` 指向已有运行目录，匹配 `--port` 和 `--screen-name`，然后运行 `mihomoctl status`。受管核心的启动参数须为：
+
+```text
+DIR/bin/mihomo -d DIR/home -f DIR/home/config.yaml
+```
+
+进程须运行在相应 GNU Screen 会话中。归属或端口不一致时会报告冲突，不会抢占外部服务。安装保留现有文件；需要搬迁运行目录时，应停止服务后复制数据、更新配置，再启动。
+
+## 运行数据与 Shell 代理
+
+`MIHOMO_ROOT` 保存核心和私有运行数据：
+
+| 路径 | 内容 |
+| --- | --- |
+| `bin/mihomo` | 核心可执行文件 |
+| `home/config.yaml` | 活动配置、节点筛选 |
+| `home/providers/` | 含节点凭据的订阅及上一份副本 |
+| `secrets/subscription.curl` | 权限 0600 的订阅地址 |
+| `run/` / `logs/` | PID、锁和日志 |
+
+默认端口为 7890；配置校验要求回环监听，并禁用 LAN、额外监听、控制 API、TUN 和 DNS 服务。`status` 验证受管进程和 socket 所有者；`health` 检查 Cloudflare 测试地址，目标站点需另行验证。
 
 ```bash
-./scripts/mihomoctl nodes
-./scripts/mihomoctl node '[vless]🇺🇸+UnitedStates3+×1'
-./scripts/mihomoctl status
-./scripts/mihomoctl health
+TOOLKIT_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/server-vpn-codex-headless"
+source "$TOOLKIT_DIR/mihomo-server/scripts/proxy-env.sh"
+# 清除当前 shell 代理：
+source "$TOOLKIT_DIR/mihomo-server/scripts/proxy-env-unset.sh"
 ```
 
-示例名称来自当前订阅，应以 `nodes` 输出为准。`node` 精确匹配完整名称，先隔离校验配置，再保存到 `home/config.yaml`。代理正在运行时自动重启；重启失败会恢复原配置并尝试恢复服务。代理停止时只保存选择，之后运行 `./scripts/mihomoctl start`。找不到名称时不会修改配置。
+自定义安装时替换 `TOOLKIT_DIR`。代理变量只影响采用它们的应用；Codex 后台任务会自行加载相同端口。
 
-取消固定节点，恢复全部订阅节点自动测速选择：
+## 排查
 
-```bash
-./scripts/mihomoctl node --auto
-```
-
-自动选择依据 Cloudflare 测试地址延迟，可能选到无法访问特定站点的节点。`status` 检查进程和监听状态，`health` 检查 HTTP CONNECT/SOCKS5 的 Cloudflare 请求；还应验证实际要访问的站点：
-
-```bash
-curl --proxy http://127.0.0.1:7890 --connect-timeout 10 --max-time 30 \
-  --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
-  https://chatgpt.com
-./scripts/mihomoctl logs
-```
-
-TLS EOF 或超时应结合日志排查节点连接；HTTP 403 表示请求收到站点拒绝响应，不能视为业务访问成功。可尝试另一个节点并再次验证。
-
-## Shell 与任务使用代理
-
-代理进程自动启动不等于透明接管服务器流量。当前部署已在 root 的 `.bashrc` 和 `.profile` 中将常见代理环境变量固定到服务器本地 `127.0.0.1:7890`。新登录 shell 会自动使用它。
-
-脚本或隔离 shell 也可以显式加载：
-
-```bash
-source /workspace/mihomo-server/scripts/proxy-env.sh
-curl --fail --silent --show-error \
-  --output /dev/null --write-out '%{http_code}\n' \
-  https://cp.cloudflare.com
-```
-
-随后从同一 shell 启动需要代理的 Codex 或其他任务。没有修改 `/etc/environment`、防火墙或默认路由。
-
-取消当前 shell 的代理变量：
-
-```bash
-source /workspace/mihomo-server/scripts/proxy-env-unset.sh
-```
-
-## 17890 与本地 VPN 映射
-
-`127.0.0.1:17890` 是旧的客户端 SSH/VPN 映射，不是服务器常驻代理。使用它的进程会在本地连接断开时失去网络。服务器任务必须使用 `127.0.0.1:7890`。
-
-修改 shell 配置不会改变已经运行的进程。若 VS Code extensionHost 或 Codex app-server 仍继承 `17890`，必须完整关闭并重新连接 VS Code Remote；仅新开终端无效。无头 Codex 控制器会在每次启动时显式覆盖为 `7890`：
-
-```bash
-codexctl doctor
-```
-
-无头运行的完整说明见 `/workspace/codex-headless/README.md`。
-
-## 运维与回滚
-
-```bash
-./scripts/mihomoctl test
-./scripts/mihomoctl logs
-./scripts/mihomoctl restart
-./scripts/mihomoctl stop
-```
-
-如需停用登录自启，可把钩子改名为非 `.sh` 后缀：
-
-```bash
-mv /etc/profile.d/mihomo-login-autostart.sh \
-  /etc/profile.d/mihomo-login-autostart.sh.disabled
-```
-
-## 连接异常排查
-
-`curl: (35) ... unexpected eof while reading` 可能来自代理上游连接被中断。先运行 `./scripts/mihomoctl logs` 查看节点连接是否超时或被限流，再运行 `update` 和 `restart`。`health` 只验证 Cloudflare 测试地址，不能保证 ChatGPT 等目标站点可用。
-
-2026-10-15 排查后，活动配置暂时筛选 `UnitedStates3` 节点，避免其他已观察到超时或上游 429 的候选节点。原配置保存在 `home/config.before-network-fix.yaml`。后续节点变化时，使用 `nodes` 查看候选项，再用 `node` 切换；订阅更新会保留该筛选。
+`conflict`：核对运行目录、端口、Screen 名及占用进程。`degraded`：查看日志，确认进程、监听和 Screen 状态是否一致。网络超时、TLS EOF 或上游限流：刷新订阅或换节点后，重新验证目标站点。

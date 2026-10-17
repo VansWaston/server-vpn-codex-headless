@@ -2,9 +2,10 @@
 set -Eeuo pipefail
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
-BASE_DIR=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+source "$SCRIPT_DIR/../../lib/toolkit.sh"
+BASE_DIR="$MIHOMO_ROOT"
 BIN="$BASE_DIR/bin/mihomo"
-CONFIG_TEMPLATE="$BASE_DIR/config/config.template.yaml"
+CONFIG_TEMPLATE="$SCRIPT_DIR/../config/config.template.yaml"
 HOME_DIR="$BASE_DIR/home"
 CONFIG="$HOME_DIR/config.yaml"
 PROVIDER_DIR="$HOME_DIR/providers"
@@ -16,10 +17,9 @@ LOG_DIR="$BASE_DIR/logs"
 LOG_FILE="$LOG_DIR/mihomo.screen.log"
 PID_FILE="$RUN_DIR/mihomo.pid"
 CONTROL_LOCK="$RUN_DIR/control.lock"
-SCREEN_NAME="mihomo-server"
-EXPECTED_LISTEN_HEX="0100007F:1ED2"
-PROXY_PORT_HEX="1ED2"
-CONTROLLER_PORT_HEX="2382"
+SCREEN_NAME="$MIHOMO_SCREEN_NAME"
+printf -v PROXY_PORT_HEX '%04X' "$MIHOMO_PORT"
+EXPECTED_LISTEN_HEX="0100007F:$PROXY_PORT_HEX"
 
 die() {
   printf '错误：%s\n' "$*" >&2
@@ -171,7 +171,6 @@ healthy_pid() {
   [[ ${#pids[@]} -eq 1 ]] || return 1
   [[ ${#listeners[@]} -eq 1 ]] || return 1
   [[ ${#screens[@]} -eq 1 && ${#all_screens[@]} -eq 1 ]] || return 1
-  [[ $(listener_records_for_port "$CONTROLLER_PORT_HEX" | wc -l) -eq 0 ]] || return 1
 
   read -r address inode <<< "${listeners[0]}"
   [[ "$address" == "$EXPECTED_LISTEN_HEX" && -n "$inode" ]] || return 1
@@ -275,7 +274,7 @@ set_url() {
 
 update_subscription() (
   set -Eeuo pipefail
-  local candidate test_dir bytes mode validation_config
+  local candidate test_dir bytes mode
   ensure_dirs
   require_bin
   [[ -f "$CURL_CONFIG" ]] || die "缺少订阅凭据；请先运行：$0 set-url"
@@ -299,8 +298,8 @@ update_subscription() (
   # Refreshing expired nodes must not depend on those same nodes working.
   printf '尝试直连下载订阅…\n'
   if ! curl --disable "${download_args[@]}" --proxy ''; then
-    printf '直连下载失败，尝试本地代理 127.0.0.1:7890…\n' >&2
-    curl --disable "${download_args[@]}" --proxy http://127.0.0.1:7890 --noproxy ''
+    printf '直连下载失败，尝试本地代理 127.0.0.1:%s…\n' "$MIHOMO_PORT" >&2
+    curl --disable "${download_args[@]}" --proxy "http://127.0.0.1:$MIHOMO_PORT" --noproxy ''
   fi
 
   bytes=$(wc -c < "$candidate")
@@ -309,9 +308,12 @@ update_subscription() (
 
   install -d -m 0700 "$test_dir/providers"
   install -m 0600 "$candidate" "$test_dir/providers/subscription.yaml"
-  validation_config="$CONFIG_TEMPLATE"
-  [[ ! -f "$CONFIG" ]] || validation_config="$CONFIG"
-  install -m 0600 "$validation_config" "$test_dir/config.yaml"
+  if [[ -f "$CONFIG" ]]; then
+    install -m 0600 "$CONFIG" "$test_dir/config.yaml"
+  else
+    sed "s/^mixed-port: .*/mixed-port: $MIHOMO_PORT/" "$CONFIG_TEMPLATE" > "$test_dir/config.yaml"
+  fi
+  python3 "$SCRIPT_DIR/check-config.py" "$test_dir/config.yaml" "$MIHOMO_PORT"
   "$BIN" -t -d "$test_dir" -f "$test_dir/config.yaml"
 
   if [[ -f "$PROVIDER" ]]; then
@@ -320,7 +322,7 @@ update_subscription() (
   install -m 0600 "$candidate" "$PROVIDER.next"
   mv -f -- "$PROVIDER.next" "$PROVIDER"
   if [[ ! -f "$CONFIG" ]]; then
-    install -m 0600 "$CONFIG_TEMPLATE" "$CONFIG.next"
+    install -m 0600 "$test_dir/config.yaml" "$CONFIG.next"
     mv -f -- "$CONFIG.next" "$CONFIG"
   fi
   printf '订阅已通过 Mihomo 语法校验并原子安装。\n'
@@ -356,6 +358,7 @@ switch_node() (
   install -m 0600 "$CONFIG" "$test_dir/previous.yaml"
   python3 "$SCRIPT_DIR/nodes.py" "$PROVIDER" --config "$CONFIG" \
     --output "$test_dir/config.yaml" --selection="$selection"
+  python3 "$SCRIPT_DIR/check-config.py" "$test_dir/config.yaml" "$MIHOMO_PORT"
   "$BIN" -t -d "$test_dir" -f "$test_dir/config.yaml"
   install -m 0600 "$test_dir/config.yaml" "$CONFIG.next"
   mv -f -- "$CONFIG.next" "$CONFIG"
@@ -380,6 +383,7 @@ test_config() {
   ensure_dirs
   require_bin
   require_active_config
+  python3 "$SCRIPT_DIR/check-config.py" "$CONFIG" "$MIHOMO_PORT"
   "$BIN" -t -d "$HOME_DIR" -f "$CONFIG"
 }
 
@@ -387,7 +391,7 @@ status_mihomo() {
   local pid
   local -a pids=() listeners=() owners=() screens=() all_screens=()
   if pid=$(healthy_pid); then
-    printf 'running pid=%s mode=screen listen=127.0.0.1:7890\n' "$pid"
+    printf 'running pid=%s mode=screen listen=127.0.0.1:%s\n' "$pid" "$MIHOMO_PORT"
     return 0
   fi
   mapfile -t pids < <(managed_pids)
@@ -433,7 +437,7 @@ stop_unlocked() {
   rm -f -- "$PID_FILE"
   remaining=$(listener_records_for_port "$PROXY_PORT_HEX" | wc -l)
   if [[ "$remaining" -gt 0 ]]; then
-    die "受管进程已停止，但 7890 仍被外部进程监听"
+    die "受管进程已停止，但 $MIHOMO_PORT 仍被外部进程监听"
   fi
   printf 'Mihomo 已停止。\n'
 }
@@ -460,7 +464,7 @@ start_unlocked() {
     mapfile -t verified_screens < <(verified_screen_tokens)
   fi
   if [[ -n "$(listener_records_for_port "$PROXY_PORT_HEX")" ]] && port_has_external_owner; then
-    die "7890 被非受管或无法识别的进程监听；拒绝启动"
+    die "$MIHOMO_PORT 被非受管或无法识别的进程监听；拒绝启动"
   fi
 
   mapfile -t pids < <(managed_pids)
@@ -471,15 +475,12 @@ start_unlocked() {
   close_verified_screens
   wait_for_verified_screens_exit || die "旧 Screen 会话在 2 秒内未退出"
   if [[ -n "$(listener_records_for_port "$PROXY_PORT_HEX")" ]]; then
-    die "清理受管进程后 7890 仍被占用；拒绝启动"
-  fi
-  if [[ -n "$(listener_records_for_port "$CONTROLLER_PORT_HEX")" ]]; then
-    die "9090 已存在监听；为保持安全边界而拒绝启动"
+    die "清理受管进程后 $MIHOMO_PORT 仍被占用；拒绝启动"
   fi
 
   umask 077
   screen -L -Logfile "$LOG_FILE" -dmS "$SCREEN_NAME" \
-    "$BIN" -d "$HOME_DIR" -f "$CONFIG"
+    "$BIN" -d "$HOME_DIR" -f "$CONFIG" 8>&- 9>&-
 
   for _ in {1..40}; do
     sleep 0.25
@@ -515,11 +516,11 @@ health_check() {
   local pid http_status socks_status
   pid=$(healthy_pid) || die "进程、Screen 或监听状态不健康；请先运行：$0 status"
   http_status=$(env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
-    curl --proxy http://127.0.0.1:7890 --silent --show-error --max-time 30 \
+    curl --disable --proxy "http://127.0.0.1:$MIHOMO_PORT" --noproxy '' --silent --show-error --max-time 30 \
     --output /dev/null --write-out '%{http_code}' https://cp.cloudflare.com) \
     || die "HTTP CONNECT 测试失败"
   socks_status=$(env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
-    curl --proxy socks5h://127.0.0.1:7890 --silent --show-error --max-time 30 \
+    curl --disable --proxy "socks5h://127.0.0.1:$MIHOMO_PORT" --noproxy '' --silent --show-error --max-time 30 \
     --output /dev/null --write-out '%{http_code}' https://cp.cloudflare.com) \
     || die "SOCKS5h 测试失败"
   [[ "$http_status" == "204" && "$socks_status" == "204" ]] \
